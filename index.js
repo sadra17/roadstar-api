@@ -20,6 +20,7 @@ app.use(helmet());
 const allowedOrigins = [
   process.env.CLIENT_ORIGIN,          // e.g. https://your-store.myshopify.com
   "http://localhost:3000",
+  "http://localhost:3001", // ADDED THIS
   "http://localhost:5173",
 ].filter(Boolean);
 
