@@ -278,4 +278,69 @@ router.delete(
   }
 );
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/bookings/:id/sms   (admin only)
+// Sends an SMS via Twilio. messageType: confirmed | declined | waitlist | reminder
+// Requires in .env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  "/bookings/:id/sms",
+  adminAuth,
+  [
+    param("id").isMongoId().withMessage("Invalid booking ID"),
+    body("messageType")
+      .isIn(["confirmed", "declined", "waitlist", "reminder"])
+      .withMessage("Invalid message type"),
+  ],
+  handleValidation,
+  async (req, res) => {
+    try {
+      const booking = await Booking.findById(req.params.id);
+      if (!booking) {
+        return res.status(404).json({ success: false, message: "Booking not found" });
+      }
+
+      // Check Twilio credentials are configured
+      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+        return res.status(503).json({
+          success: false,
+          message: "Twilio is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to your environment variables.",
+        });
+      }
+
+      const first = booking.firstName;
+      const messages = {
+        confirmed: `Hi ${first}! Your Roadstar Tire appointment is CONFIRMED for ${booking.date} at ${booking.time} (${booking.service}). See you soon! — Roadstar Tire`,
+        declined:  `Hi ${first}, unfortunately we had to cancel your ${booking.time} appointment on ${booking.date}. Please call us to reschedule. — Roadstar Tire`,
+        waitlist:  `Hi ${first}! A spot just opened at Roadstar Tire on ${booking.date}. Reply or call us to claim it! — Roadstar Tire`,
+        reminder:  `Reminder: Hi ${first}, your Roadstar Tire appointment is TODAY at ${booking.time} (${booking.service}). See you soon! — Roadstar Tire`,
+      };
+
+      const twilioClient = require("twilio")(
+        process.env.TWILIO_ACCOUNT_SID,
+        process.env.TWILIO_AUTH_TOKEN
+      );
+
+      const message = await twilioClient.messages.create({
+        body: messages[req.body.messageType],
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to:   booking.phone,
+      });
+
+      console.log(`[SMS] Sent to ${booking.phone} — SID: ${message.sid}`);
+
+      res.json({
+        success: true,
+        message: `SMS sent to ${booking.phone}`,
+        sid:     message.sid,
+      });
+
+    } catch (err) {
+      console.error("[SMS] Error:", err.message);
+      res.status(500).json({ success: false, message: err.message || "SMS failed" });
+    }
+  }
+);
+
 module.exports = router;
