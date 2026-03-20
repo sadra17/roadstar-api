@@ -2,28 +2,25 @@ const express = require("express");
 const { body, query, param } = require("express-validator");
 const router  = express.Router();
 
-const Booking  = require("../models/Booking");
-const adminAuth = require("../middleware/adminAuth");
+const Booking           = require("../models/Booking");
+const adminAuth         = require("../middleware/adminAuth");   // plain function
 const { handleValidation } = require("../middleware/validate");
 const { ALL_SLOTS, toMinutes } = require("../config/slots");
 
-const getDuration = (s) => s === "Tire Change + Installation" ? 40 : 10;
+const getDuration = (s) => {
+  if (s === "Tire Change + Installation") return 40;
+  if (s === "Flat Tire Repair") return 15;
+  if (s === "Wheel Balancing") return 20;
+  if (s === "Tire Rotation") return 20;
+  if (s === "TPMS Service") return 15;
+  return 10;
+};
 
-// ── Twilio helper ─────────────────────────────────────────────────────────────
+// ── Twilio ────────────────────────────────────────────────────────────────────
 const sendTwilioSMS = async (to, body) => {
-  if (!process.env.TWILIO_ACCOUNT_SID) {
-    console.warn("[SMS] Twilio not configured — skipping");
-    return null;
-  }
-  const client = require("twilio")(
-    process.env.TWILIO_ACCOUNT_SID,
-    process.env.TWILIO_AUTH_TOKEN
-  );
-  return client.messages.create({
-    body,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    to,
-  });
+  if (!process.env.TWILIO_ACCOUNT_SID) { console.warn("[SMS] Twilio not configured"); return null; }
+  const client = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  return client.messages.create({ body, from: process.env.TWILIO_PHONE_NUMBER, to });
 };
 
 const smsTemplates = {
@@ -35,7 +32,7 @@ const smsTemplates = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/book  — public: create booking
+// POST /api/book  — public
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/book",
@@ -43,7 +40,7 @@ router.post(
     body("firstName").trim().notEmpty().withMessage("First name required").isLength({ max: 60 }).escape(),
     body("lastName").trim().notEmpty().withMessage("Last name required").isLength({ max: 60 }).escape(),
     body("phone").trim().notEmpty().matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone"),
-    body("service").isIn(["Tire Change", "Tire Purchase", "Tire Change + Installation"]).withMessage("Invalid service"),
+    body("service").isIn(["Tire Change", "Tire Purchase", "Tire Change + Installation", "Flat Tire Repair", "Wheel Balancing", "Tire Rotation", "TPMS Service", "Other"]).withMessage("Invalid service"),
     body("customService").optional().trim().isLength({ max: 200 }).escape(),
     body("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
       .custom(val => {
@@ -68,40 +65,24 @@ router.post(
       const booking = await Booking.create({
         firstName, lastName, phone, service,
         customService: customService || "",
-        date, time,
-        duration: getDuration(service),
-        status: "pending",
+        date, time, duration: getDuration(service), status: "pending",
       });
 
-      // ── Emit Socket.io event so dashboard updates instantly ──────────────
+      // Emit real-time event to admin dashboard
       if (req.io) {
         req.io.emit("new_booking", {
-          id:       booking._id,
-          customer: booking.customer,
-          service:  booking.service,
-          date:     booking.date,
-          time:     booking.time,
-          phone:    booking.phone,
-          status:   booking.status,
+          id: booking._id, customer: booking.customer,
+          service: booking.service, date: booking.date,
+          time: booking.time, phone: booking.phone, status: booking.status,
         });
       }
 
       res.status(201).json({
-        success: true,
-        message: "Booking created",
-        booking: {
-          id:       booking._id,
-          customer: booking.customer,
-          service:  booking.service,
-          date:     booking.date,
-          time:     booking.time,
-          status:   booking.status,
-        },
+        success: true, message: "Booking created",
+        booking: { id: booking._id, customer: booking.customer, service: booking.service, date: booking.date, time: booking.time, status: booking.status },
       });
     } catch (err) {
-      if (err.code === 11000) {
-        return res.status(409).json({ success: false, message: "That slot was just taken. Please choose another." });
-      }
+      if (err.code === 11000) return res.status(409).json({ success: false, message: "That slot was just taken. Please choose another." });
       console.error("POST /api/book:", err);
       res.status(500).json({ success: false, message: "Server error" });
     }
@@ -118,10 +99,7 @@ router.get(
   async (req, res) => {
     try {
       const { date } = req.query;
-      const booked = await Booking.find(
-        { date, status: { $nin: ["cancelled"] } },
-        { time: 1, _id: 0 }
-      );
+      const booked = await Booking.find({ date, status: { $nin: ["cancelled"] } }, { time: 1, _id: 0 });
       const bookedTimes = new Set(booked.map(b => b.time));
 
       const now = new Date();
@@ -143,37 +121,24 @@ router.get(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/queue?date=YYYY-MM-DD  — public: queue position + wait time
+// GET /api/queue  — public: position + wait time for customer
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/queue", async (req, res) => {
   try {
     const { date, bookingId } = req.query;
-    if (!date || !bookingId) {
-      return res.status(400).json({ success: false, message: "date and bookingId required" });
-    }
+    if (!date || !bookingId) return res.status(400).json({ success: false, message: "date and bookingId required" });
 
-    // Get all active bookings for that date, sorted by time
-    const activeBookings = await Booking.find({
-      date,
-      status: { $in: ["pending", "confirmed", "waitlist"] },
-    }).sort({ time: 1 });
+    const active = await Booking.find({ date, status: { $in: ["pending","confirmed","waitlist"] } }).sort({ time: 1 });
+    const myIndex = active.findIndex(b => b._id.toString() === bookingId);
 
-    const myIndex = activeBookings.findIndex(b => b._id.toString() === bookingId);
-    if (myIndex === -1) {
-      return res.json({ success: true, position: 0, waitMinutes: 0, message: "Booking not found in queue" });
-    }
+    if (myIndex === -1) return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are up next!" });
 
-    const position    = myIndex; // 0 = you're next
-    const waitMinutes = position * 40; // 40 min avg per service
+    const position    = myIndex;
+    const waitMinutes = position * 40;
 
     res.json({
-      success: true,
-      position,
-      waitMinutes,
-      totalInQueue: activeBookings.length,
-      message: position === 0
-        ? "You are next!"
-        : `${position} customer${position > 1 ? "s" : ""} ahead of you. Est. wait: ${waitMinutes} min`,
+      success: true, position, waitMinutes, totalInQueue: active.length,
+      message: position === 0 ? "You are next!" : `${position} customer${position > 1 ? "s" : ""} ahead of you. Est. wait: ${waitMinutes} min`,
     });
   } catch (err) {
     console.error("GET /api/queue:", err);
@@ -189,7 +154,6 @@ router.get("/bookings", adminAuth, async (req, res) => {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
     if (req.query.date)   filter.date   = req.query.date;
-
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
     res.json({ success: true, count: bookings.length, bookings });
   } catch (err) {
@@ -199,15 +163,15 @@ router.get("/bookings", adminAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/bookings/:id  — admin only: update status, notes, reschedule
-// Auto-sends SMS when status changes to confirmed, declined, completed
+// PATCH /api/bookings/:id  — admin only
+// Auto-sends SMS when status changes to confirmed / completed / cancelled
 // ─────────────────────────────────────────────────────────────────────────────
 router.patch(
   "/bookings/:id",
   adminAuth,
   [
     param("id").isMongoId().withMessage("Invalid ID"),
-    body("status").optional().isIn(["pending", "confirmed", "waitlist", "completed", "cancelled"]),
+    body("status").optional().isIn(["pending","confirmed","waitlist","completed","cancelled"]),
     body("notes").optional().trim().isLength({ max: 500 }).escape(),
     body("time").optional().isIn(ALL_SLOTS),
     body("date").optional().matches(/^\d{4}-\d{2}-\d{2}$/),
@@ -219,20 +183,14 @@ router.patch(
       const { id } = req.params;
       const { status, notes, time, date, sendSMS: triggerSMS } = req.body;
 
-      // Check slot conflict if rescheduling
       if (time || date) {
         const current = await Booking.findById(id);
         if (!current) return res.status(404).json({ success: false, message: "Not found" });
-
         const conflict = await Booking.findOne({
-          date: date || current.date,
-          time: time || current.time,
-          _id:  { $ne: id },
-          status: { $nin: ["cancelled"] },
+          date: date || current.date, time: time || current.time,
+          _id: { $ne: id }, status: { $nin: ["cancelled"] },
         });
-        if (conflict) {
-          return res.status(409).json({ success: false, message: "That slot is already taken." });
-        }
+        if (conflict) return res.status(409).json({ success: false, message: "That slot is already taken." });
       }
 
       const updates = {};
@@ -242,38 +200,26 @@ router.patch(
       if (date   !== undefined) updates.date   = date;
       if (status === "completed") updates.completedAt = new Date();
 
-      const updated = await Booking.findByIdAndUpdate(
-        id, { $set: updates }, { new: true, runValidators: true }
-      );
+      const updated = await Booking.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
       if (!updated) return res.status(404).json({ success: false, message: "Not found" });
 
-      // ── Auto-SMS on status change ─────────────────────────────────────────
+      // Auto-SMS on key status changes
       let smsSent = false;
-      const autoSmsStatuses = ["confirmed", "completed", "cancelled"];
-      if (
-        status &&
-        autoSmsStatuses.includes(status) &&
-        triggerSMS !== false   // allow caller to suppress with sendSMS: false
-      ) {
+      if (status && ["confirmed","completed","cancelled"].includes(status) && triggerSMS !== false) {
         try {
           const msgKey = status === "cancelled" ? "declined" : status;
-          const msg    = smsTemplates[msgKey]?.(updated);
+          const msg = smsTemplates[msgKey]?.(updated);
           if (msg) {
             await sendTwilioSMS(updated.phone, msg);
             await Booking.findByIdAndUpdate(id, { $set: { smsSentAt: new Date() } });
             smsSent = true;
-            console.log(`[SMS] Auto-sent (${status}) to ${updated.phone}`);
           }
         } catch (smsErr) {
           console.error("[SMS] Auto-send failed:", smsErr.message);
-          // Don't fail the whole request if SMS fails
         }
       }
 
-      // ── Emit socket event so dashboard updates in real-time ───────────────
-      if (req.io) {
-        req.io.emit("booking_updated", { id, updates, booking: updated });
-      }
+      if (req.io) req.io.emit("booking_updated", { id, booking: updated });
 
       res.json({ success: true, booking: updated, smsSent });
     } catch (err) {
@@ -295,9 +241,7 @@ router.delete(
     try {
       const deleted = await Booking.findByIdAndDelete(req.params.id);
       if (!deleted) return res.status(404).json({ success: false, message: "Not found" });
-
       if (req.io) req.io.emit("booking_deleted", { id: req.params.id });
-
       res.json({ success: true, message: "Booking deleted" });
     } catch (err) {
       console.error("DELETE /api/bookings/:id:", err);
@@ -307,14 +251,14 @@ router.delete(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/bookings/:id/sms  — admin only: manual SMS send
+// POST /api/bookings/:id/sms  — admin only: manual SMS
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/bookings/:id/sms",
   adminAuth,
   [
     param("id").isMongoId(),
-    body("messageType").isIn(["confirmed", "declined", "waitlist", "reminder", "completed"]),
+    body("messageType").isIn(["confirmed","declined","waitlist","reminder","completed"]),
   ],
   handleValidation,
   async (req, res) => {
@@ -323,10 +267,7 @@ router.post(
       if (!booking) return res.status(404).json({ success: false, message: "Not found" });
 
       if (!process.env.TWILIO_ACCOUNT_SID) {
-        return res.status(503).json({
-          success: false,
-          message: "Twilio not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER to env vars.",
-        });
+        return res.status(503).json({ success: false, message: "Twilio not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER to Render env vars." });
       }
 
       const msg = smsTemplates[req.body.messageType]?.(booking);
@@ -335,7 +276,7 @@ router.post(
       const message = await sendTwilioSMS(booking.phone, msg);
       await Booking.findByIdAndUpdate(req.params.id, { $set: { smsSentAt: new Date() } });
 
-      console.log(`[SMS] Manual sent to ${booking.phone} — SID: ${message?.sid}`);
+      console.log(`[SMS] Sent to ${booking.phone} — SID: ${message?.sid}`);
       res.json({ success: true, message: `SMS sent to ${booking.phone}`, sid: message?.sid });
     } catch (err) {
       console.error("[SMS] Error:", err.message);

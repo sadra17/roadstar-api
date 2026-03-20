@@ -6,7 +6,7 @@ const bookingSchema = new mongoose.Schema({
   phone:         { type: String, required: true, trim: true },
   service: {
     type: String, required: true,
-    enum: ["Tire Change", "Tire Purchase", "Tire Change + Installation"],
+    enum: ["Tire Change", "Tire Purchase", "Tire Change + Installation", "Flat Tire Repair", "Wheel Balancing", "Tire Rotation", "TPMS Service", "Other"],
   },
   customService: { type: String, trim: true, maxlength: 200, default: "" },
   date:          { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
@@ -17,13 +17,12 @@ const bookingSchema = new mongoose.Schema({
     enum: ["pending", "confirmed", "waitlist", "completed", "cancelled"],
     default: "pending",
   },
-  notes:         { type: String, trim: true, maxlength: 500, default: "" },
-  completedAt:   { type: Date, default: null },
-  smsSentAt:     { type: Date, default: null },
+  notes:       { type: String, trim: true, maxlength: 500, default: "" },
+  completedAt: { type: Date, default: null },
+  smsSentAt:   { type: Date, default: null },
 }, { timestamps: true });
 
 bookingSchema.index({ date: 1, time: 1 }, { unique: true });
-bookingSchema.index({ status: 1, date: 1 });
 
 bookingSchema.virtual("customer").get(function () {
   return `${this.firstName} ${this.lastName}`;
