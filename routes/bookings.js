@@ -2,72 +2,39 @@ const express = require("express");
 const { body, query, param } = require("express-validator");
 const router = express.Router();
 
-const Booking = require("../models/Booking");
-const adminAuth = require("../middleware/adminAuth");
+const Booking        = require("../models/Booking");
+const adminAuth      = require("../middleware/adminAuth");
 const { handleValidation } = require("../middleware/validate");
 const { ALL_SLOTS, toMinutes } = require("../config/slots");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: derive duration from service
-// ─────────────────────────────────────────────────────────────────────────────
-const getDuration = (service) =>
-  service === "Tire Change + Installation" ? 40 : 10;
+const getDuration = (s) => s === "Tire Change + Installation" ? 40 : 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/book
-// Creates a new booking after checking availability
+// POST /api/book  — create a new booking
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/book",
   [
-    body("firstName")
-      .trim()
-      .notEmpty().withMessage("First name is required")
-      .isLength({ max: 60 }).withMessage("First name too long")
-      .escape(),
-    body("lastName")
-      .trim()
-      .notEmpty().withMessage("Last name is required")
-      .isLength({ max: 60 }).withMessage("Last name too long")
-      .escape(),
-    body("phone")
-      .trim()
-      .notEmpty().withMessage("Phone number is required")
-      .matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone number"),
-    body("service")
-      .trim()
-      .notEmpty().withMessage("Service type is required")
-      .isIn(["Tire Change", "Tire Purchase", "Tire Change + Installation"])
-      .withMessage("Invalid service type"),
-    body("customService")
-      .optional()
-      .trim()
-      .isLength({ max: 200 }).withMessage("Custom note too long")
-      .escape(),
-    body("date")
-      .trim()
-      .notEmpty().withMessage("Date is required")
-      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
+    body("firstName").trim().notEmpty().withMessage("First name required").isLength({ max: 60 }).escape(),
+    body("lastName").trim().notEmpty().withMessage("Last name required").isLength({ max: 60 }).escape(),
+    body("phone").trim().notEmpty().withMessage("Phone required").matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone"),
+    body("service").trim().notEmpty().isIn(["Tire Change", "Tire Purchase", "Tire Change + Installation"]).withMessage("Invalid service"),
+    body("customService").optional().trim().isLength({ max: 200 }).escape(),
+    body("date").trim().notEmpty().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
       .custom((val) => {
         const d = new Date(val);
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const today = new Date(); today.setHours(0, 0, 0, 0);
         if (isNaN(d.getTime())) throw new Error("Invalid date");
-        if (d < today) throw new Error("Cannot book a date in the past");
+        if (d < today) throw new Error("Cannot book a past date");
         return true;
       }),
-    body("time")
-      .trim()
-      .notEmpty().withMessage("Time slot is required")
-      .isIn(ALL_SLOTS).withMessage("Invalid time slot"),
+    body("time").trim().notEmpty().isIn(ALL_SLOTS).withMessage("Invalid time slot"),
   ],
   handleValidation,
   async (req, res) => {
     try {
-      const { firstName, lastName, phone, service, customService, date, time } =
-        req.body;
+      const { firstName, lastName, phone, service, customService, date, time } = req.body;
 
-      // Check for existing booking at this date+time
       const conflict = await Booking.findOne({ date, time });
       if (conflict) {
         return res.status(409).json({
@@ -77,20 +44,16 @@ router.post(
       }
 
       const booking = await Booking.create({
-        firstName,
-        lastName,
-        phone,
-        service,
+        firstName, lastName, phone, service,
         customService: customService || "",
-        date,
-        time,
+        date, time,
         duration: getDuration(service),
         status: "pending",
       });
 
       res.status(201).json({
         success: true,
-        message: "Booking created successfully",
+        message: "Booking created",
         booking: {
           id: booking._id,
           customer: booking.customer,
@@ -101,51 +64,37 @@ router.post(
         },
       });
     } catch (err) {
-      // Handle Mongo duplicate key (race condition safety net)
       if (err.code === 11000) {
-        return res.status(409).json({
-          success: false,
-          message: "That time slot was just taken. Please choose another.",
-        });
+        return res.status(409).json({ success: false, message: "That slot was just taken. Please choose another." });
       }
-      console.error("POST /api/book error:", err);
-      res.status(500).json({ success: false, message: "Server error. Try again." });
+      console.error("POST /api/book:", err);
+      res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/availability?date=YYYY-MM-DD
-// Returns available (not yet booked) time slots for a given date
-// Removes past slots if date is today
+// GET /api/availability?date=YYYY-MM-DD  — available time slots
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
   "/availability",
   [
-    query("date")
-      .trim()
-      .notEmpty().withMessage("date query param is required")
-      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("date must be YYYY-MM-DD"),
+    query("date").trim().notEmpty().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("date must be YYYY-MM-DD"),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const { date } = req.query;
 
-      // Fetch all bookings on this date (only need the time field)
       const booked = await Booking.find(
         { date, status: { $nin: ["cancelled"] } },
         { time: 1, _id: 0 }
       );
       const bookedTimes = new Set(booked.map((b) => b.time));
 
-      // If today, filter out slots that are already past
       const now = new Date();
-      const isToday =
-        date === now.toISOString().slice(0, 10);
-      const currentMinutes = isToday
-        ? now.getHours() * 60 + now.getMinutes()
-        : -1;
+      const isToday = date === now.toISOString().slice(0, 10);
+      const currentMinutes = isToday ? now.getHours() * 60 + now.getMinutes() : -1;
 
       const available = ALL_SLOTS.filter((slot) => {
         if (bookedTimes.has(slot)) return false;
@@ -155,15 +104,14 @@ router.get(
 
       res.json({ success: true, date, available, booked: [...bookedTimes] });
     } catch (err) {
-      console.error("GET /api/availability error:", err);
-      res.status(500).json({ success: false, message: "Server error." });
+      console.error("GET /api/availability:", err);
+      res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/bookings   (admin only)
-// Returns all bookings, newest first, with optional ?status= filter
+// GET /api/bookings  — all bookings (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/bookings", adminAuth, async (req, res) => {
   try {
@@ -174,35 +122,23 @@ router.get("/bookings", adminAuth, async (req, res) => {
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
     res.json({ success: true, count: bookings.length, bookings });
   } catch (err) {
-    console.error("GET /api/bookings error:", err);
-    res.status(500).json({ success: false, message: "Server error." });
+    console.error("GET /api/bookings:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/bookings/:id   (admin only)
-// Update status and/or notes and/or reschedule time
+// PATCH /api/bookings/:id  — update status / reschedule / notes (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 router.patch(
   "/bookings/:id",
   adminAuth,
   [
-    param("id").isMongoId().withMessage("Invalid booking ID"),
-    body("status")
-      .optional()
-      .isIn(["pending", "confirmed", "waitlist", "cancelled"])
-      .withMessage("Invalid status"),
-    body("notes")
-      .optional()
-      .trim()
-      .isLength({ max: 500 }).withMessage("Notes too long")
-      .escape(),
-    body("time")
-      .optional()
-      .isIn(ALL_SLOTS).withMessage("Invalid time slot"),
-    body("date")
-      .optional()
-      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD"),
+    param("id").isMongoId().withMessage("Invalid ID"),
+    body("status").optional().isIn(["pending", "confirmed", "waitlist", "cancelled"]),
+    body("notes").optional().trim().isLength({ max: 500 }).escape(),
+    body("time").optional().isIn(ALL_SLOTS),
+    body("date").optional().matches(/^\d{4}-\d{2}-\d{2}$/),
   ],
   handleValidation,
   async (req, res) => {
@@ -210,25 +146,18 @@ router.patch(
       const { id } = req.params;
       const { status, notes, time, date } = req.body;
 
-      // If rescheduling, ensure no conflict on the new slot
       if (time || date) {
         const booking = await Booking.findById(id);
-        if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
-
-        const newDate = date || booking.date;
-        const newTime = time || booking.time;
+        if (!booking) return res.status(404).json({ success: false, message: "Not found" });
 
         const conflict = await Booking.findOne({
-          date: newDate,
-          time: newTime,
+          date: date || booking.date,
+          time: time || booking.time,
           _id: { $ne: id },
           status: { $nin: ["cancelled"] },
         });
         if (conflict) {
-          return res.status(409).json({
-            success: false,
-            message: "That time slot is already taken.",
-          });
+          return res.status(409).json({ success: false, message: "That slot is already taken." });
         }
       }
 
@@ -239,56 +168,46 @@ router.patch(
       if (date   !== undefined) updates.date   = date;
 
       const updated = await Booking.findByIdAndUpdate(
-        id,
-        { $set: updates },
-        { new: true, runValidators: true }
+        id, { $set: updates }, { new: true, runValidators: true }
       );
-
-      if (!updated) {
-        return res.status(404).json({ success: false, message: "Booking not found" });
-      }
+      if (!updated) return res.status(404).json({ success: false, message: "Not found" });
 
       res.json({ success: true, booking: updated });
     } catch (err) {
-      console.error("PATCH /api/bookings/:id error:", err);
-      res.status(500).json({ success: false, message: "Server error." });
+      console.error("PATCH /api/bookings/:id:", err);
+      res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/bookings/:id   (admin only)
+// DELETE /api/bookings/:id  (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete(
   "/bookings/:id",
   adminAuth,
-  [param("id").isMongoId().withMessage("Invalid booking ID")],
+  [param("id").isMongoId().withMessage("Invalid ID")],
   handleValidation,
   async (req, res) => {
     try {
       const deleted = await Booking.findByIdAndDelete(req.params.id);
-      if (!deleted) {
-        return res.status(404).json({ success: false, message: "Booking not found" });
-      }
+      if (!deleted) return res.status(404).json({ success: false, message: "Not found" });
       res.json({ success: true, message: "Booking deleted" });
     } catch (err) {
-      console.error("DELETE /api/bookings/:id error:", err);
-      res.status(500).json({ success: false, message: "Server error." });
+      console.error("DELETE /api/bookings/:id:", err);
+      res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/bookings/:id/sms   (admin only)
-// Sends an SMS via Twilio. messageType: confirmed | declined | waitlist | reminder
-// Requires in .env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
+// POST /api/bookings/:id/sms  — send Twilio SMS (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/bookings/:id/sms",
   adminAuth,
   [
-    param("id").isMongoId().withMessage("Invalid booking ID"),
+    param("id").isMongoId().withMessage("Invalid ID"),
     body("messageType")
       .isIn(["confirmed", "declined", "waitlist", "reminder"])
       .withMessage("Invalid message type"),
@@ -297,44 +216,36 @@ router.post(
   async (req, res) => {
     try {
       const booking = await Booking.findById(req.params.id);
-      if (!booking) {
-        return res.status(404).json({ success: false, message: "Booking not found" });
-      }
+      if (!booking) return res.status(404).json({ success: false, message: "Not found" });
 
-      // Check Twilio credentials are configured
       if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
         return res.status(503).json({
           success: false,
-          message: "Twilio is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to your environment variables.",
+          message: "Twilio not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER to environment variables.",
         });
       }
 
       const first = booking.firstName;
       const messages = {
         confirmed: `Hi ${first}! Your Roadstar Tire appointment is CONFIRMED for ${booking.date} at ${booking.time} (${booking.service}). See you soon! — Roadstar Tire`,
-        declined:  `Hi ${first}, unfortunately we had to cancel your ${booking.time} appointment on ${booking.date}. Please call us to reschedule. — Roadstar Tire`,
-        waitlist:  `Hi ${first}! A spot just opened at Roadstar Tire on ${booking.date}. Reply or call us to claim it! — Roadstar Tire`,
+        declined:  `Hi ${first}, we had to cancel your ${booking.time} appointment on ${booking.date}. Please call us to reschedule. — Roadstar Tire`,
+        waitlist:  `Hi ${first}! A spot just opened at Roadstar Tire on ${booking.date}. Call us now to claim it! — Roadstar Tire`,
         reminder:  `Reminder: Hi ${first}, your Roadstar Tire appointment is TODAY at ${booking.time} (${booking.service}). See you soon! — Roadstar Tire`,
       };
 
-      const twilioClient = require("twilio")(
+      const client = require("twilio")(
         process.env.TWILIO_ACCOUNT_SID,
         process.env.TWILIO_AUTH_TOKEN
       );
 
-      const message = await twilioClient.messages.create({
+      const message = await client.messages.create({
         body: messages[req.body.messageType],
         from: process.env.TWILIO_PHONE_NUMBER,
         to:   booking.phone,
       });
 
       console.log(`[SMS] Sent to ${booking.phone} — SID: ${message.sid}`);
-
-      res.json({
-        success: true,
-        message: `SMS sent to ${booking.phone}`,
-        sid:     message.sid,
-      });
+      res.json({ success: true, message: `SMS sent to ${booking.phone}`, sid: message.sid });
 
     } catch (err) {
       console.error("[SMS] Error:", err.message);
