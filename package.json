@@ -1,23 +1,19 @@
 {
-  "name": "roadstar-tire-api",
+  "name": "roadstar-admin-dashboard",
   "version": "1.0.0",
-  "description": "Roadstar Tire booking system API",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
-  },
+  "private": true,
   "dependencies": {
-    "cors": "^2.8.6",
-    "dotenv": "^16.6.1",
-    "express": "^4.22.1",
-    "express-rate-limit": "^7.5.1",
-    "express-validator": "^7.0.1",
-    "helmet": "^7.2.0",
-    "mongoose": "^8.23.0",
-    "morgan": "^1.10.1"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-scripts": "5.0.1"
   },
-  "devDependencies": {
-    "nodemon": "^3.1.14"
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test":  "react-scripts test"
+  },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version"]
   }
 }
