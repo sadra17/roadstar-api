@@ -1,86 +1,73 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// config/business.js
-// Single source of truth for Roadstar Tire business rules.
-// Imported by routes, scheduler, and tests.
+// config/business.js  v6
+// Single source of truth for all Roadstar Tire business rules.
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
 const { DateTime } = require("luxon");
 
-// ── Timezone ──────────────────────────────────────────────────────────────────
-const TZ = "America/Toronto";
+const TZ           = "America/Toronto";
+const NORMAL_BAYS  = 3;   // normal service bays (jacks)
+const ALIGN_LANES  = 1;   // wheel alignment lane (separate capacity)
+const SLOT_INTERVAL = 15; // minutes between slot start times
 
 // ── Business hours ────────────────────────────────────────────────────────────
-// Keyed by JS getDay() values: 0=Sun, 1=Mon … 6=Sat
-// null = closed all day
+// 0=Sun, 1=Mon … 6=Sat.  null = closed all day.
 const HOURS = {
-  0: null,                                        // Sunday  — closed
-  1: { open: "09:00", close: "18:00" },           // Monday
-  2: { open: "09:30", close: "18:00" },           // Tuesday
-  3: { open: "09:30", close: "18:00" },           // Wednesday
-  4: { open: "09:30", close: "18:00" },           // Thursday
-  5: { open: "09:30", close: "18:00" },           // Friday
-  6: { open: "09:30", close: "16:00" },           // Saturday
+  0: null,
+  1: { open: "09:00", close: "18:00" },
+  2: { open: "09:30", close: "18:00" },
+  3: { open: "09:30", close: "18:00" },
+  4: { open: "09:30", close: "18:00" },
+  5: { open: "09:30", close: "18:00" },
+  6: { open: "09:30", close: "16:00" },
 };
 
 // ── Service catalog ───────────────────────────────────────────────────────────
-// usesJack: true  → consumes 1 of 3 jacks; subject to capacity check
-// usesJack: false → no capacity gate; always available when open
+// capacityType:
+//   "bay"       → uses 1 of 3 normal bays
+//   "alignment" → uses the 1 alignment lane
+//   "none"      → no capacity consumed
 const SERVICE_DEFS = {
-  "Tire Change":                { duration: 40, usesJack: true  },
-  "Tire Change + Installation": { duration: 40, usesJack: true  },
-  "Flat Tire Repair":           { duration: 15, usesJack: true  },
-  "Wheel Balancing":            { duration: 20, usesJack: true  },
-  "Tire Rotation":              { duration: 20, usesJack: true  },
-  "TPMS Service":               { duration: 15, usesJack: true  },
-  "Tire Purchase":              { duration: 10, usesJack: false },
-  "Other":                      { duration: 15, usesJack: false },
+  "Tire Change + Installation": { duration: 40, capacityType: "bay"       },
+  "Flat Tire Repair":           { duration: 15, capacityType: "bay"       },
+  "Tire Rotation":              { duration: 20, capacityType: "bay"       },
+  "Wheel Alignment":            { duration: 60, capacityType: "alignment" },
+  "Tire Purchase":              { duration: 10, capacityType: "none"      },
+  "Other":                      { duration: 30, capacityType: "none"      }, // admin-safe default
 };
 
 const ALL_SERVICES = Object.keys(SERVICE_DEFS);
-const TOTAL_JACKS  = 3;
-const SLOT_INTERVAL = 15; // minutes between candidate start times
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Capacity decisions ────────────────────────────────────────────────────────
+// Use confirmed-only blocking (Option A).
+// Rationale: cleaner UX, no phantom holds, no expiry complexity.
+// Pending bookings are treated as soft holds only at the final race-condition
+// check in validateCapacity — they do NOT block availability display.
+const CAPACITY_BLOCKING_STATUSES = ["confirmed"];
 
-/**
- * Returns { duration, usesJack } for a service name.
- * Falls back to { duration:15, usesJack:false } for unknown/custom.
- */
-function resolveService(serviceName) {
-  return SERVICE_DEFS[serviceName] || { duration: 15, usesJack: false };
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function resolveService(service) {
+  return SERVICE_DEFS[service] || { duration: 30, capacityType: "none" };
 }
 
-/**
- * Returns business hours object { open:"HH:MM", close:"HH:MM" } | null
- * for a given "YYYY-MM-DD" date string in Toronto time.
- */
 function getHoursForDate(dateStr) {
-  // Luxon weekday: 1=Mon … 7=Sun — convert to JS 0=Sun … 6=Sat
   const dt  = DateTime.fromISO(dateStr, { zone: TZ });
-  const dow = dt.weekday === 7 ? 0 : dt.weekday;
+  const dow = dt.weekday === 7 ? 0 : dt.weekday; // luxon: 1=Mon,7=Sun → JS 0-6
   return HOURS[dow] ?? null;
 }
 
-/** "HH:MM" → integer minutes since midnight */
 function toMinutes(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
   return h * 60 + m;
 }
 
-/** integer minutes → "HH:MM" */
 function fromMinutes(mins) {
   const h = Math.floor(mins / 60);
   const m = mins % 60;
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
 }
 
-/**
- * "9:00 AM" / "10:40 PM" → "HH:MM"
- * If already "HH:MM", returns as-is.
- */
 function display12To24(str) {
   if (!str) return null;
   if (/^\d{2}:\d{2}$/.test(str)) return str;
@@ -88,150 +75,155 @@ function display12To24(str) {
   if (!m) return null;
   let h = parseInt(m[1], 10);
   const mn = parseInt(m[2], 10);
-  const period = m[3].toUpperCase();
-  if (period === "PM" && h !== 12) h += 12;
-  if (period === "AM" && h === 12) h = 0;
-  return `${String(h).padStart(2, "0")}:${String(mn).padStart(2, "0")}`;
+  const p  = m[3].toUpperCase();
+  if (p === "PM" && h !== 12) h += 12;
+  if (p === "AM" && h === 12) h = 0;
+  return `${String(h).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
 }
 
-/**
- * "HH:MM" → "9:00 AM"
- */
 function display24To12(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
-  const period = h >= 12 ? "PM" : "AM";
-  const h12    = h === 0 ? 12 : h > 12 ? h - 12 : h;
-  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+  const p   = h >= 12 ? "PM" : "AM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${h12}:${String(m).padStart(2,"0")} ${p}`;
 }
 
-/**
- * Generate all valid slot start times for a date + service duration.
- * Returns array of 12-hour display strings ("9:00 AM", …)
- * that have room to fit fully before closing.
- */
+// Generates all valid start times for a service duration on a given date.
+// Returns 12h display strings.
 function generateSlots(dateStr, duration) {
   const hours = getHoursForDate(dateStr);
   if (!hours) return [];
-
   const openM  = toMinutes(hours.open);
   const closeM = toMinutes(hours.close);
-  const last   = closeM - duration;    // latest valid start
-
-  const slots = [];
+  const last   = closeM - duration;
+  const slots  = [];
   for (let t = openM; t <= last; t += SLOT_INTERVAL) {
     slots.push(display24To12(fromMinutes(t)));
   }
   return slots;
 }
 
-/**
- * Count how many jack-using bookings overlap a proposed [start, start+duration).
- * @param {Array}  bookings  — lean DB objects with { time, duration, usesJack }
- * @param {string} slot24    — "HH:MM" proposed start
- * @param {number} duration  — proposed duration in minutes
- */
-function jacksInUse(bookings, slot24, duration) {
+// Count how many confirmed bookings of a given capacityType overlap a window.
+function countOverlapping(bookings, slot24, duration, capacityType) {
   const ns = toMinutes(slot24);
   const ne = ns + duration;
   let count = 0;
   for (const b of bookings) {
-    if (!b.usesJack) continue;
+    if (b.capacityType !== capacityType) continue;
     const bs = toMinutes(display12To24(b.time) || b.time);
     const be = bs + (b.duration || 10);
-    if (ns < be && ne > bs) count++;  // any overlap
+    if (ns < be && ne > bs) count++;
   }
   return count;
 }
 
-/**
- * Full availability check for a (date, service) pair.
- * Queries the DB for existing bookings and filters slots by capacity.
- * Returns { available: string[], businessHours, duration, usesJack }
- *
- * @param {string} dateStr   "YYYY-MM-DD"
- * @param {string} service   canonical service name
- * @param {Model}  Booking   Mongoose model (passed in to avoid circular require)
- */
-async function computeAvailability(dateStr, service, Booking) {
-  const { duration, usesJack } = resolveService(service);
-  const hours = getHoursForDate(dateStr);
-  if (!hours) {
-    return { available: [], businessHours: null, duration, usesJack };
-  }
-
-  const candidate12h = generateSlots(dateStr, duration);
-
-  // Fetch all active bookings for this date
-  const existing = await Booking.find(
-    { date: dateStr, status: { $nin: ["cancelled"] } },
-    { time: 1, duration: 1, usesJack: 1, _id: 0 }
-  ).lean();
-
-  // Strip past slots when date === today (Toronto time)
-  const now      = DateTime.now().setZone(TZ);
-  const isToday  = dateStr === now.toISODate();
-  const nowMins  = isToday ? now.hour * 60 + now.minute : -1;
-
-  const available = [];
-  for (const slot12 of candidate12h) {
-    const slot24 = display12To24(slot12);
-    if (!slot24) continue;
-
-    // Skip past times
-    if (isToday && toMinutes(slot24) <= nowMins) continue;
-
-    // Jack capacity gate (only for jack-consuming services)
-    if (usesJack && jacksInUse(existing, slot24, duration) >= TOTAL_JACKS) continue;
-
-    available.push(slot12);
-  }
-
-  return { available, businessHours: hours, duration, usesJack };
+// Maximum capacity for a capacityType.
+function maxCapacity(capacityType) {
+  if (capacityType === "bay")       return NORMAL_BAYS;
+  if (capacityType === "alignment") return ALIGN_LANES;
+  return Infinity; // "none" — no limit
 }
 
-/**
- * Server-side capacity validation for a new / updated booking.
- * Call before Booking.create() and before Booking.findByIdAndUpdate() when time changes.
- *
- * @param {string}      dateStr     "YYYY-MM-DD"
- * @param {string}      slot        "9:00 AM" (stored format) or "HH:MM"
- * @param {string}      service
- * @param {Model}       Booking
- * @param {ObjectId|string|null} excludeId  booking to exclude (for reschedule)
- * @returns {{ ok: boolean, reason?: string }}
- */
+// ── Main availability computation ─────────────────────────────────────────────
+async function computeAvailability(dateStr, service, Booking) {
+  const { duration, capacityType } = resolveService(service);
+  const hours = getHoursForDate(dateStr);
+  if (!hours) return { available: [], businessHours: null, duration, capacityType };
+
+  const candidates = generateSlots(dateStr, duration);
+
+  // Fetch CONFIRMED bookings for this date (confirmed-only blocking)
+  const existing = await Booking.find(
+    {
+      date:         dateStr,
+      status:       { $in: CAPACITY_BLOCKING_STATUSES },
+      capacityType: { $ne: "none" },
+    },
+    { time: 1, duration: 1, capacityType: 1, _id: 0 }
+  ).lean();
+
+  // Strip past times (today only, Toronto time)
+  const now     = DateTime.now().setZone(TZ);
+  const isToday = dateStr === now.toISODate();
+  const nowMins = isToday ? now.hour * 60 + now.minute : -1;
+
+  const cap   = maxCapacity(capacityType);
+  const avail = [];
+
+  for (const slot12 of candidates) {
+    const slot24 = display12To24(slot12);
+    if (!slot24) continue;
+    if (isToday && toMinutes(slot24) <= nowMins) continue;
+
+    if (capacityType !== "none") {
+      const occupied = countOverlapping(existing, slot24, duration, capacityType);
+      if (occupied >= cap) continue;
+    }
+
+    avail.push(slot12);
+  }
+
+  return { available: avail, businessHours: hours, duration, capacityType };
+}
+
+// ── Server-side capacity validation (race-condition guard) ────────────────────
+// Called inside POST /api/book and PATCH /api/bookings/:id when rescheduling.
 async function validateCapacity(dateStr, slot, service, Booking, excludeId) {
-  const { duration, usesJack } = resolveService(service);
-  if (!usesJack) return { ok: true };
+  const { duration, capacityType } = resolveService(service);
+  if (capacityType === "none") return { ok: true };
 
   const slot24 = display12To24(slot) || slot;
+  const cap    = maxCapacity(capacityType);
+
   const q = {
-    date:     dateStr,
-    status:   { $nin: ["cancelled"] },
-    usesJack: true,
+    date:         dateStr,
+    status:       { $in: CAPACITY_BLOCKING_STATUSES },
+    capacityType: capacityType,
   };
   if (excludeId) q._id = { $ne: excludeId };
 
-  const existing = await Booking.find(q, { time: 1, duration: 1, usesJack: 1, _id: 0 }).lean();
-  const occupied = jacksInUse(existing, slot24, duration);
+  const existing = await Booking.find(q, { time: 1, duration: 1, capacityType: 1, _id: 0 }).lean();
+  const occupied = countOverlapping(existing, slot24, duration, capacityType);
 
-  if (occupied >= TOTAL_JACKS) {
+  if (occupied >= cap) {
+    const noun = capacityType === "alignment" ? "alignment lane" : "service bay";
     return {
       ok: false,
-      reason:
-        "All 3 service bays are occupied during that time window. Please select a different slot.",
+      reason: `That time is no longer available — the ${noun} is fully booked during that window. Please choose another time.`,
     };
   }
   return { ok: true };
 }
 
+// ── "Live at bay" helper ──────────────────────────────────────────────────────
+// Returns bookings that are actively in service right now based on
+// confirmed status + time window containing current Toronto time.
+function isActiveInBayNow(booking) {
+  const now     = DateTime.now().setZone(TZ);
+  const todayStr = now.toISODate();
+  if (booking.date !== todayStr) return false;
+  if (booking.status !== "confirmed") return false;
+  if (booking.capacityType === "none") return false;
+
+  const slot24 = display12To24(booking.time);
+  if (!slot24) return false;
+
+  const startMins = toMinutes(slot24);
+  const endMins   = startMins + (booking.duration || 10);
+  const nowMins   = now.hour * 60 + now.minute;
+
+  return nowMins >= startMins && nowMins < endMins;
+}
+
 module.exports = {
   TZ,
-  HOURS,
-  TOTAL_JACKS,
+  NORMAL_BAYS,
+  ALIGN_LANES,
   SLOT_INTERVAL,
+  HOURS,
   SERVICE_DEFS,
   ALL_SERVICES,
+  CAPACITY_BLOCKING_STATUSES,
   resolveService,
   getHoursForDate,
   toMinutes,
@@ -239,7 +231,9 @@ module.exports = {
   display12To24,
   display24To12,
   generateSlots,
-  jacksInUse,
+  countOverlapping,
+  maxCapacity,
   computeAvailability,
   validateCapacity,
+  isActiveInBayNow,
 };

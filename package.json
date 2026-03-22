@@ -1,6 +1,6 @@
 {
   "name": "roadstar-api",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -17,6 +17,7 @@
     "luxon":              "^3.4.4",
     "mongoose":           "^8.3.1",
     "morgan":             "^1.10.0",
+    "node-fetch":         "^2.7.0",
     "socket.io":          "^4.7.5",
     "twilio":             "^5.0.0"
   },

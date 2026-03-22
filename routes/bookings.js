@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// routes/bookings.js  v5
+// routes/bookings.js  v6
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
@@ -18,13 +18,14 @@ const {
   computeAvailability,
   validateCapacity,
   getHoursForDate,
+  isActiveInBayNow,
+  NORMAL_BAYS,
 } = require("../config/business");
 
-// Google review link (short — keep under 160 chars with rest of message)
-const GOOGLE_REVIEW =
-  "https://g.page/r/CYPKn0GrR0t3EBM/review";
+// ── Google review link ────────────────────────────────────────────────────────
+const GOOGLE_REVIEW = "https://g.page/r/CYPKn0GrR0t3EBM/review";
 
-// ── Twilio helper ─────────────────────────────────────────────────────────────
+// ── Twilio ────────────────────────────────────────────────────────────────────
 async function sendTwilioSMS(to, body) {
   if (!process.env.TWILIO_ACCOUNT_SID) {
     console.warn("[SMS] Twilio not configured — skipping");
@@ -42,33 +43,37 @@ async function sendTwilioSMS(to, body) {
 }
 
 // ── SMS templates ─────────────────────────────────────────────────────────────
+// All display names are taken directly from booking.service / booking.customService
+function svcLabel(b) {
+  return b.service === "Other" && b.customService
+    ? `Other — ${b.customService}`
+    : b.service;
+}
+
 const sms = {
   confirmed: (b) =>
-    `Hi ${b.firstName}! Your Roadstar Tire appt is CONFIRMED for ${b.date} at ${b.time} (${b.service}). See you soon! — Roadstar Tire`,
+    `Hi ${b.firstName}! Your Roadstar Tire appointment is CONFIRMED for ${b.date} at ${b.time} (${svcLabel(b)}). See you soon! — Roadstar Tire`,
 
   declined: (b) =>
-    `Hi ${b.firstName}, we had to cancel your ${b.time} appt on ${b.date}. Please call us to reschedule. — Roadstar Tire`,
+    `Hi ${b.firstName}, we had to cancel your ${b.time} appointment on ${b.date}. Please call us to reschedule. — Roadstar Tire`,
 
   waitlist: (b) =>
     `Hi ${b.firstName}! A spot just opened at Roadstar Tire on ${b.date}. Call us to claim it! — Roadstar Tire`,
 
   reminder: (b) =>
-    `Hi ${b.firstName}, reminder: your Roadstar Tire appt is TODAY at ${b.time} for ${b.service}. See you soon! — Roadstar Tire`,
+    `Hi ${b.firstName}, reminder: your Roadstar Tire appointment is TODAY at ${b.time} for ${svcLabel(b)}. See you soon! — Roadstar Tire`,
 
-  // completed WITH review link
+  // FIXED: review link at bottom, as required
   completed_review: (b) =>
-    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${b.service}. ` +
-    `A quick Google review means the world to us: ${GOOGLE_REVIEW} — Roadstar Tire`,
+    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${svcLabel(b)}. Drive safe!\n\nClick the link to leave us a review\n${GOOGLE_REVIEW}`,
 
-  // completed WITHOUT review link
   completed_no_review: (b) =>
-    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${b.service}. Drive safe! — Roadstar Tire`,
+    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${svcLabel(b)}. Drive safe! — Roadstar Tire`,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/business-hours
-// Returns the weekly schedule and full service catalog.
-// Used by Shopify booking form to render service cards and calendar.
+// Returns service catalog + weekly hours. Used by booking form.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/business-hours", (_req, res) => {
   res.json({
@@ -81,8 +86,6 @@ router.get("/business-hours", (_req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/availability?date=YYYY-MM-DD&service=...
-// Returns available 12h display slots for a given date + service.
-// Capacity-aware: respects jack count and overlapping durations.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
   "/availability",
@@ -96,84 +99,35 @@ router.get(
   handleValidation,
   async (req, res) => {
     try {
-      const { date, service = "Tire Change" } = req.query;
+      const { date, service = "Tire Change + Installation" } = req.query;
       const result = await computeAvailability(date, service, Booking);
-      res.json({
-        success: true,
-        date,
-        available:     result.available,
-        businessHours: result.businessHours,
-        duration:      result.duration,
-        usesJack:      result.usesJack,
-      });
+      res.json({ success: true, date, ...result });
     } catch (err) {
       console.error("GET /api/availability:", err);
-      res.status(500).json({ success: false, message: "Server error" });
+      res.status(500).json({ success: false, message: "Could not load availability." });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/queue
-// ─────────────────────────────────────────────────────────────────────────────
-router.get("/queue", async (req, res) => {
-  try {
-    const { date, bookingId } = req.query;
-    if (!date || !bookingId)
-      return res.status(400).json({ success: false, message: "date and bookingId required" });
-
-    const active = await Booking.find(
-      { date, status: { $in: ["pending", "confirmed", "waitlist"] } },
-      { time: 1, _id: 1 }
-    ).sort({ time: 1 });
-
-    const myIndex = active.findIndex((b) => b._id.toString() === bookingId);
-    if (myIndex === -1)
-      return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are next!" });
-
-    const waitMinutes = myIndex * 40;
-    res.json({
-      success:      true,
-      position:     myIndex,
-      waitMinutes,
-      totalInQueue: active.length,
-      message:
-        myIndex === 0
-          ? "You are next!"
-          : `${myIndex} customer${myIndex > 1 ? "s" : ""} ahead · Est. wait: ${waitMinutes} min`,
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/book  — public
+// POST /api/book — public
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/book",
   [
-    body("firstName")
-      .trim().notEmpty().withMessage("First name required")
-      .isLength({ max: 60 }).escape(),
-    body("lastName")
-      .trim().notEmpty().withMessage("Last name required")
-      .isLength({ max: 60 }).escape(),
-    body("phone")
-      .trim().notEmpty()
-      .matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone number"),
-    body("service")
-      .isIn(ALL_SERVICES).withMessage("Invalid service"),
+    body("firstName").trim().notEmpty().withMessage("First name is required.").isLength({ max: 60 }).escape(),
+    body("lastName").trim().notEmpty().withMessage("Last name is required.").isLength({ max: 60 }).escape(),
+    body("phone").trim().notEmpty().matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Please enter a valid phone number."),
+    body("service").isIn(ALL_SERVICES).withMessage("Please select a valid service."),
     body("customService").optional().trim().isLength({ max: 300 }).escape(),
     body("date")
       .trim()
-      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
+      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Invalid date format.")
       .custom((val) => {
-        if (!getHoursForDate(val))
-          throw new Error("Roadstar Tire is closed on this day.");
+        if (!getHoursForDate(val)) throw new Error("Roadstar Tire is closed on this day.");
         return true;
       }),
-    body("time").trim().notEmpty().withMessage("Time slot required"),
+    body("time").trim().notEmpty().withMessage("Please select a time slot."),
     body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
   ],
@@ -187,11 +141,12 @@ router.post(
         tireSize, doesntKnowTireSize,
       } = req.body;
 
-      const { duration, usesJack } = resolveService(service);
+      const { duration, capacityType } = resolveService(service);
 
-      // Server-side capacity re-validation (prevents race-condition overbooking)
+      // Server-side capacity validation (race-condition guard)
       const cap = await validateCapacity(date, time, service, Booking, null);
       if (!cap.ok) {
+        // Clean user-facing message — no raw errors
         return res.status(409).json({ success: false, message: cap.reason });
       }
 
@@ -199,13 +154,12 @@ router.post(
         firstName, lastName, phone,
         service,
         customService: customService || "",
-        date, time, duration, usesJack,
+        date, time, duration, capacityType,
         tireSize:           tireSize || "",
         doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
         status: "pending",
       });
 
-      // Emit Socket.io event
       if (req.io) {
         req.io.emit("new_booking", {
           id:                booking._id,
@@ -216,32 +170,38 @@ router.post(
           time:              booking.time,
           phone:             booking.phone,
           status:            booking.status,
+          capacityType:      booking.capacityType,
           tireSize:          booking.tireSize,
-          doesntKnowTireSize: booking.doesntKnowTireSize,
+          doesntKnowTireSize:booking.doesntKnowTireSize,
         });
       }
 
       res.status(201).json({
         success: true,
-        message: "Booking created",
+        message: "Booking created successfully.",
         booking: {
-          id:       booking._id,
-          customer: booking.customer,
-          service:  booking.service,
-          date:     booking.date,
-          time:     booking.time,
-          status:   booking.status,
+          id:           booking._id,
+          customer:     booking.customer,
+          service:      booking.service,
+          date:         booking.date,
+          time:         booking.time,
+          status:       booking.status,
+          capacityType: booking.capacityType,
         },
       });
     } catch (err) {
       console.error("POST /api/book:", err);
-      res.status(500).json({ success: false, message: "Server error" });
+      // Never expose raw errors to customers
+      res.status(500).json({
+        success: false,
+        message: "Something went wrong. Please try again or call us directly.",
+      });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/bookings  — admin
+// GET /api/bookings — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/bookings", adminAuth, async (req, res) => {
   try {
@@ -256,39 +216,25 @@ router.get("/bookings", adminAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/customers  — admin: grouped customer history
+// GET /api/customers — admin: grouped history
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/customers", adminAuth, async (req, res) => {
   try {
     const { search } = req.query;
     const query = {};
-
     if (search) {
-      const re = new RegExp(
-        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-        "i"
-      );
+      const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       query.$or = [{ firstName: re }, { lastName: re }, { phone: re }];
     }
-
-    const bookings = await Booking.find(query)
-      .sort({ createdAt: -1 })
-      .lean();
-
-    // Group by phone → customer profile
+    const bookings = await Booking.find(query).sort({ createdAt: -1 }).lean();
     const map = {};
     for (const b of bookings) {
       const key = b.phone;
       if (!map[key]) {
         map[key] = {
-          phone:       b.phone,
-          firstName:   b.firstName,
-          lastName:    b.lastName,
-          visitCount:  0,
-          bookings:    [],
-          tireSizes:   new Set(),
-          services:    new Set(),
-          lastVisit:   b.date,
+          phone: b.phone, firstName: b.firstName, lastName: b.lastName,
+          visitCount: 0, bookings: [], tireSizes: new Set(),
+          services: new Set(), lastVisit: b.date,
         };
       }
       const c = map[key];
@@ -299,15 +245,9 @@ router.get("/customers", adminAuth, async (req, res) => {
       if (b.doesntKnowTireSize && !b.tireSize) c.tireSizes.add("Doesn't know size");
       if (b.date > c.lastVisit) c.lastVisit = b.date;
     }
-
     const customers = Object.values(map)
-      .map((c) => ({
-        ...c,
-        tireSizes: [...c.tireSizes],
-        services:  [...c.services],
-      }))
+      .map(c => ({ ...c, tireSizes: [...c.tireSizes], services: [...c.services] }))
       .sort((a, b) => b.visitCount - a.visitCount);
-
     res.json({ success: true, count: customers.length, customers });
   } catch (err) {
     res.status(500).json({ success: false, message: "Server error" });
@@ -315,103 +255,224 @@ router.get("/customers", adminAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/bookings/:id  — admin
+// GET /api/live-bay — admin: who is actively in a bay right now
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/live-bay", adminAuth, async (req, res) => {
+  try {
+    const { DateTime } = require("luxon");
+    const { TZ, display12To24, toMinutes } = require("../config/business");
+    const now      = DateTime.now().setZone(TZ);
+    const todayStr = now.toISODate();
+    const nowMins  = now.hour * 60 + now.minute;
+
+    // Confirmed today, not completed/cancelled
+    const todayConfirmed = await Booking.find({
+      date:   todayStr,
+      status: "confirmed",
+    }).sort({ time: 1 }).lean();
+
+    // Active = time window currently encompasses now
+    const active = [];
+    const upcoming = [];
+    for (const b of todayConfirmed) {
+      if (b.capacityType === "none") continue;
+      const s24 = display12To24(b.time);
+      if (!s24) continue;
+      const startM = toMinutes(s24);
+      const endM   = startM + (b.duration || 10);
+      if (nowMins >= startM && nowMins < endM) {
+        active.push({ ...b, minutesRemaining: endM - nowMins });
+      } else if (startM > nowMins) {
+        upcoming.push(b);
+      }
+    }
+
+    // Assign active bookings to bay numbers (stable: sort by time then assign 1,2,3)
+    // Normal bays get bays 1-3, alignment gets its own lane
+    let bayCounter = 1;
+    const activeBays = active.map(b => {
+      const assignedBay = b.capacityType === "alignment" ? "alignment"
+        : (b.bayNumber || bayCounter++);
+      return { ...b, assignedBay };
+    });
+
+    res.json({
+      success: true,
+      active:  activeBays,
+      upcoming: upcoming.slice(0, 6), // next 6
+      now:     now.toISO(),
+    });
+  } catch (err) {
+    console.error("GET /api/live-bay:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/bookings/:id/bay-snooze — admin: snooze "are they done?" check
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/bookings/:id/bay-snooze", adminAuth, async (req, res) => {
+  try {
+    const { DateTime } = require("luxon");
+    const { TZ } = require("../config/business");
+    const snoozeUntil = DateTime.now().setZone(TZ).plus({ minutes: 10 }).toJSDate();
+    const updated = await Booking.findByIdAndUpdate(
+      req.params.id,
+      { $set: { bayCheckSnoozeUntil: snoozeUntil } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ success: false, message: "Not found" });
+    res.json({ success: true, booking: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/google-reviews — admin: latest Google reviews
+// Returns real data if GOOGLE_PLACES_API_KEY + GOOGLE_PLACE_ID are set,
+// otherwise returns graceful mock data so the UI always renders.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/google-reviews", adminAuth, async (req, res) => {
+  try {
+    const apiKey  = process.env.GOOGLE_PLACES_API_KEY;
+    const placeId = process.env.GOOGLE_PLACE_ID;
+
+    if (apiKey && placeId) {
+      // Real Google Places API
+      const url = `https://maps.googleapis.com/maps/api/place/details/json` +
+        `?place_id=${placeId}&fields=reviews,rating,user_ratings_total` +
+        `&key=${apiKey}`;
+      const fetch = require("node-fetch");
+      const resp  = await fetch(url);
+      const data  = await resp.json();
+
+      if (data.status !== "OK") {
+        throw new Error(`Google API: ${data.status}`);
+      }
+
+      const reviews = (data.result.reviews || [])
+        .sort((a, b) => b.time - a.time)
+        .map(r => ({
+          author:    r.author_name,
+          rating:    r.rating,
+          text:      r.text,
+          time:      r.time * 1000,
+          relativeTime: r.relative_time_description,
+          profilePhoto: r.profile_photo_url || null,
+          real:      true,
+        }));
+
+      return res.json({
+        success: true,
+        reviews,
+        overallRating:    data.result.rating,
+        totalRatings:     data.result.user_ratings_total,
+        apiConnected:     true,
+      });
+    }
+
+    // ── Graceful fallback — mock data (UI stays functional without API key) ──
+    res.json({
+      success: true,
+      apiConnected: false,
+      setupNote: "Add GOOGLE_PLACES_API_KEY and GOOGLE_PLACE_ID to Render env vars to show real reviews.",
+      reviews: [
+        { author:"Sarah M.", rating:5, text:"Fast service and very professional staff. Fixed my flat tire in under 15 minutes. Highly recommend!", relativeTime:"2 days ago", time: Date.now()-2*86400000, real:false },
+        { author:"James T.", rating:5, text:"Best tire shop in the area. The team at Roadstar Tire is always honest and upfront about pricing.", relativeTime:"1 week ago", time: Date.now()-7*86400000, real:false },
+        { author:"Priya K.", rating:4, text:"Great experience, quick wheel alignment and rotation. Will definitely be back.", relativeTime:"2 weeks ago", time: Date.now()-14*86400000, real:false },
+      ],
+      overallRating: 4.8,
+      totalRatings:  127,
+    });
+  } catch (err) {
+    console.error("GET /api/google-reviews:", err.message);
+    res.status(500).json({ success: false, message: "Could not load reviews." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/bookings/:id — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.patch(
   "/bookings/:id",
   adminAuth,
   [
     param("id").isMongoId(),
-    body("status")
-      .optional()
-      .isIn(["pending", "confirmed", "waitlist", "completed", "cancelled"]),
+    body("status").optional().isIn(["pending","confirmed","waitlist","completed","cancelled"]),
     body("notes").optional().trim().isLength({ max: 1000 }).escape(),
     body("time").optional().trim(),
     body("date").optional().matches(/^\d{4}-\d{2}-\d{2}$/),
     body("sendSMS").optional().isBoolean(),
-    body("completedSmsVariant")
-      .optional()
-      .isIn(["with_review", "without_review", "none"]),
+    body("completedSmsVariant").optional().isIn(["with_review","without_review","none"]),
     body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
+    body("bayNumber").optional().isInt({ min: 1, max: 3 }),
+    body("bayType").optional().isIn(["normal","alignment",null]),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
       const {
-        status,
-        notes,
-        time,
-        date,
-        sendSMS: triggerSMS,
-        completedSmsVariant,
-        tireSize,
-        doesntKnowTireSize,
+        status, notes, time, date, sendSMS: triggerSMS,
+        completedSmsVariant, tireSize, doesntKnowTireSize,
+        bayNumber, bayType,
       } = req.body;
 
-      // Validate capacity if rescheduling
+      // Validate capacity when rescheduling
       if (time || date) {
         const current = await Booking.findById(id);
-        if (!current)
-          return res.status(404).json({ success: false, message: "Booking not found" });
-
+        if (!current) return res.status(404).json({ success: false, message: "Booking not found." });
         const newDate = date || current.date;
         const newTime = time || current.time;
         const cap = await validateCapacity(newDate, newTime, current.service, Booking, id);
-        if (!cap.ok)
-          return res.status(409).json({ success: false, message: cap.reason });
+        if (!cap.ok) return res.status(409).json({ success: false, message: cap.reason });
       }
 
       const updates = {};
-      if (status    !== undefined) updates.status = status;
-      if (notes     !== undefined) updates.notes  = notes;
-      if (time      !== undefined) updates.time   = time;
-      if (date      !== undefined) updates.date   = date;
-      if (tireSize  !== undefined) updates.tireSize = tireSize;
-      if (doesntKnowTireSize !== undefined)
-        updates.doesntKnowTireSize = doesntKnowTireSize;
-      if (completedSmsVariant !== undefined)
-        updates.completedSmsVariant = completedSmsVariant;
+      if (status     !== undefined) updates.status = status;
+      if (notes      !== undefined) updates.notes  = notes;
+      if (time       !== undefined) updates.time   = time;
+      if (date       !== undefined) updates.date   = date;
+      if (tireSize   !== undefined) updates.tireSize = tireSize;
+      if (doesntKnowTireSize !== undefined) updates.doesntKnowTireSize = doesntKnowTireSize;
+      if (completedSmsVariant !== undefined) updates.completedSmsVariant = completedSmsVariant;
+      if (bayNumber  !== undefined) updates.bayNumber = bayNumber;
+      if (bayType    !== undefined) updates.bayType = bayType;
+      if (status === "confirmed" && !updates.activeInBayAt) {
+        // Optionally set bay entry when confirmed
+      }
       if (status === "completed") updates.completedAt = new Date();
 
-      const updated = await Booking.findByIdAndUpdate(
-        id,
-        { $set: updates },
-        { new: true, runValidators: true }
-      );
-      if (!updated)
-        return res.status(404).json({ success: false, message: "Booking not found" });
+      const updated = await Booking.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
+      if (!updated) return res.status(404).json({ success: false, message: "Booking not found." });
 
-      // ── Auto-SMS ─────────────────────────────────────────────────────────
+      // ── Auto-SMS ───────────────────────────────────────────────────────────
       let smsSent = false;
       if (status && triggerSMS !== false) {
         let msg = null;
-
         if (status === "confirmed") msg = sms.confirmed(updated);
         if (status === "cancelled") msg = sms.declined(updated);
-
         if (status === "completed") {
-          if (completedSmsVariant === "with_review")
-            msg = sms.completed_review(updated);
-          else if (completedSmsVariant === "without_review")
-            msg = sms.completed_no_review(updated);
-          // "none" → no SMS, intentional
+          // FIXED: map completedSmsVariant correctly
+          if (completedSmsVariant === "with_review")    msg = sms.completed_review(updated);
+          if (completedSmsVariant === "without_review") msg = sms.completed_no_review(updated);
+          // "none" → no SMS intentionally
         }
-
         if (msg) {
           try {
             await sendTwilioSMS(updated.phone, msg);
             await Booking.findByIdAndUpdate(id, { $set: { smsSentAt: new Date() } });
             smsSent = true;
+            console.log(`[SMS] Sent (${status}/${completedSmsVariant||""}) to ${updated.phone}`);
           } catch (smsErr) {
-            console.error("[SMS] Auto-send failed:", smsErr.message);
+            console.error("[SMS] Failed:", smsErr.message);
           }
         }
       }
 
       if (req.io) req.io.emit("booking_updated", { id, booking: updated });
-
       res.json({ success: true, booking: updated, smsSent });
     } catch (err) {
       console.error("PATCH /api/bookings/:id:", err);
@@ -421,7 +482,7 @@ router.patch(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/bookings/:id  — admin
+// DELETE /api/bookings/:id — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete(
   "/bookings/:id",
@@ -431,8 +492,7 @@ router.delete(
   async (req, res) => {
     try {
       const deleted = await Booking.findByIdAndDelete(req.params.id);
-      if (!deleted)
-        return res.status(404).json({ success: false, message: "Booking not found" });
+      if (!deleted) return res.status(404).json({ success: false, message: "Not found" });
       if (req.io) req.io.emit("booking_deleted", { id: req.params.id });
       res.json({ success: true, message: "Booking deleted" });
     } catch (err) {
@@ -442,7 +502,7 @@ router.delete(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/bookings/:id/sms  — admin: manual SMS
+// POST /api/bookings/:id/sms — admin: manual SMS
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/bookings/:id/sms",
@@ -450,33 +510,55 @@ router.post(
   [
     param("id").isMongoId(),
     body("messageType").isIn([
-      "confirmed", "declined", "waitlist", "reminder",
-      "completed_review", "completed_no_review",
+      "confirmed","declined","waitlist","reminder",
+      "completed_review","completed_no_review",
     ]),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const booking = await Booking.findById(req.params.id);
-      if (!booking)
-        return res.status(404).json({ success: false, message: "Not found" });
-
+      if (!booking) return res.status(404).json({ success: false, message: "Not found" });
       if (!process.env.TWILIO_ACCOUNT_SID)
-        return res.status(503).json({ success: false, message: "Twilio not configured" });
+        return res.status(503).json({ success: false, message: "Twilio not configured." });
 
-      const fn  = sms[req.body.messageType];
-      if (!fn)
-        return res.status(400).json({ success: false, message: "Invalid message type" });
+      const fn = sms[req.body.messageType];
+      if (!fn) return res.status(400).json({ success: false, message: "Invalid message type." });
 
       const msg     = fn(booking);
       const message = await sendTwilioSMS(booking.phone, msg);
       await Booking.findByIdAndUpdate(req.params.id, { $set: { smsSentAt: new Date() } });
-
+      console.log(`[SMS] Manual (${req.body.messageType}) → ${booking.phone} SID:${message?.sid}`);
       res.json({ success: true, message: `SMS sent to ${booking.phone}`, sid: message?.sid });
     } catch (err) {
+      console.error("[SMS] Error:", err.message);
       res.status(500).json({ success: false, message: err.message || "SMS failed" });
     }
   }
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/queue — public: position + wait time
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/queue", async (req, res) => {
+  try {
+    const { date, bookingId } = req.query;
+    if (!date || !bookingId)
+      return res.status(400).json({ success: false, message: "date and bookingId required" });
+    const active = await Booking.find(
+      { date, status: { $in: ["pending","confirmed","waitlist"] } },
+      { time: 1, _id: 1 }
+    ).sort({ time: 1 });
+    const idx = active.findIndex(b => b._id.toString() === bookingId);
+    if (idx === -1) return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are next!" });
+    const waitMinutes = idx * 40;
+    res.json({
+      success: true, position: idx, waitMinutes, totalInQueue: active.length,
+      message: idx === 0 ? "You are next!" : `${idx} customer${idx>1?"s":""} ahead — est. wait: ${waitMinutes} min`,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 module.exports = router;
