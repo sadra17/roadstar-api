@@ -1,118 +1,111 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// routes/bookings.js  v5
+// ─────────────────────────────────────────────────────────────────────────────
+"use strict";
+
 const express = require("express");
 const { body, query, param } = require("express-validator");
 const router  = express.Router();
 
-const Booking           = require("../models/Booking");
-const adminAuth         = require("../middleware/adminAuth");   // plain function
+const Booking   = require("../models/Booking");
+const adminAuth = require("../middleware/adminAuth");
 const { handleValidation } = require("../middleware/validate");
-const { ALL_SLOTS, toMinutes } = require("../config/slots");
+const {
+  ALL_SERVICES,
+  SERVICE_DEFS,
+  HOURS,
+  resolveService,
+  computeAvailability,
+  validateCapacity,
+  getHoursForDate,
+} = require("../config/business");
 
-const getDuration = (s) => {
-  if (s === "Tire Change + Installation") return 40;
-  if (s === "Flat Tire Repair") return 15;
-  if (s === "Wheel Balancing") return 20;
-  if (s === "Tire Rotation") return 20;
-  if (s === "TPMS Service") return 15;
-  return 10;
-};
+// Google review link (short — keep under 160 chars with rest of message)
+const GOOGLE_REVIEW =
+  "https://g.page/r/CYPKn0GrR0t3EBM/review";
 
-// ── Twilio ────────────────────────────────────────────────────────────────────
-const sendTwilioSMS = async (to, body) => {
-  if (!process.env.TWILIO_ACCOUNT_SID) { console.warn("[SMS] Twilio not configured"); return null; }
-  const client = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  return client.messages.create({ body, from: process.env.TWILIO_PHONE_NUMBER, to });
-};
+// ── Twilio helper ─────────────────────────────────────────────────────────────
+async function sendTwilioSMS(to, body) {
+  if (!process.env.TWILIO_ACCOUNT_SID) {
+    console.warn("[SMS] Twilio not configured — skipping");
+    return null;
+  }
+  const client = require("twilio")(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+  return client.messages.create({
+    body,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    to,
+  });
+}
 
-const smsTemplates = {
-  confirmed: (b) => `Hi ${b.firstName}! Your Roadstar Tire appointment is CONFIRMED for ${b.date} at ${b.time} (${b.service}). See you soon! — Roadstar Tire`,
-  declined:  (b) => `Hi ${b.firstName}, we had to cancel your ${b.time} appointment on ${b.date}. Please call to reschedule. — Roadstar Tire`,
-  waitlist:  (b) => `Hi ${b.firstName}! A spot just opened at Roadstar Tire on ${b.date}. Call us to claim it! — Roadstar Tire`,
-  reminder:  (b) => `Reminder: Hi ${b.firstName}, your Roadstar Tire appointment is TODAY at ${b.time} (${b.service}). — Roadstar Tire`,
-  completed: (b) => `Thanks for visiting Roadstar Tire, ${b.firstName}! Your ${b.service} is done. Drive safe! — Roadstar Tire`,
+// ── SMS templates ─────────────────────────────────────────────────────────────
+const sms = {
+  confirmed: (b) =>
+    `Hi ${b.firstName}! Your Roadstar Tire appt is CONFIRMED for ${b.date} at ${b.time} (${b.service}). See you soon! — Roadstar Tire`,
+
+  declined: (b) =>
+    `Hi ${b.firstName}, we had to cancel your ${b.time} appt on ${b.date}. Please call us to reschedule. — Roadstar Tire`,
+
+  waitlist: (b) =>
+    `Hi ${b.firstName}! A spot just opened at Roadstar Tire on ${b.date}. Call us to claim it! — Roadstar Tire`,
+
+  reminder: (b) =>
+    `Hi ${b.firstName}, reminder: your Roadstar Tire appt is TODAY at ${b.time} for ${b.service}. See you soon! — Roadstar Tire`,
+
+  // completed WITH review link
+  completed_review: (b) =>
+    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${b.service}. ` +
+    `A quick Google review means the world to us: ${GOOGLE_REVIEW} — Roadstar Tire`,
+
+  // completed WITHOUT review link
+  completed_no_review: (b) =>
+    `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${b.service}. Drive safe! — Roadstar Tire`,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/book  — public
+// GET /api/business-hours
+// Returns the weekly schedule and full service catalog.
+// Used by Shopify booking form to render service cards and calendar.
 // ─────────────────────────────────────────────────────────────────────────────
-router.post(
-  "/book",
+router.get("/business-hours", (_req, res) => {
+  res.json({
+    success:     true,
+    hours:       HOURS,
+    services:    ALL_SERVICES,
+    serviceDefs: SERVICE_DEFS,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/availability?date=YYYY-MM-DD&service=...
+// Returns available 12h display slots for a given date + service.
+// Capacity-aware: respects jack count and overlapping durations.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  "/availability",
   [
-    body("firstName").trim().notEmpty().withMessage("First name required").isLength({ max: 60 }).escape(),
-    body("lastName").trim().notEmpty().withMessage("Last name required").isLength({ max: 60 }).escape(),
-    body("phone").trim().notEmpty().matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone"),
-    body("service").isIn(["Tire Change", "Tire Purchase", "Tire Change + Installation", "Flat Tire Repair", "Wheel Balancing", "Tire Rotation", "TPMS Service", "Other"]).withMessage("Invalid service"),
-    body("customService").optional().trim().isLength({ max: 200 }).escape(),
-    body("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
-      .custom(val => {
-        const d = new Date(val), today = new Date();
-        today.setHours(0,0,0,0);
-        if (isNaN(d.getTime())) throw new Error("Invalid date");
-        if (d < today) throw new Error("Cannot book a past date");
-        return true;
-      }),
-    body("time").isIn(ALL_SLOTS).withMessage("Invalid time slot"),
+    query("date")
+      .trim()
+      .matches(/^\d{4}-\d{2}-\d{2}$/)
+      .withMessage("date must be YYYY-MM-DD"),
+    query("service").optional().trim(),
   ],
   handleValidation,
   async (req, res) => {
     try {
-      const { firstName, lastName, phone, service, customService, date, time } = req.body;
-
-      const conflict = await Booking.findOne({ date, time });
-      if (conflict) {
-        return res.status(409).json({ success: false, message: "That time slot is already booked. Please choose another." });
-      }
-
-      const booking = await Booking.create({
-        firstName, lastName, phone, service,
-        customService: customService || "",
-        date, time, duration: getDuration(service), status: "pending",
+      const { date, service = "Tire Change" } = req.query;
+      const result = await computeAvailability(date, service, Booking);
+      res.json({
+        success: true,
+        date,
+        available:     result.available,
+        businessHours: result.businessHours,
+        duration:      result.duration,
+        usesJack:      result.usesJack,
       });
-
-      // Emit real-time event to admin dashboard
-      if (req.io) {
-        req.io.emit("new_booking", {
-          id: booking._id, customer: booking.customer,
-          service: booking.service, date: booking.date,
-          time: booking.time, phone: booking.phone, status: booking.status,
-        });
-      }
-
-      res.status(201).json({
-        success: true, message: "Booking created",
-        booking: { id: booking._id, customer: booking.customer, service: booking.service, date: booking.date, time: booking.time, status: booking.status },
-      });
-    } catch (err) {
-      if (err.code === 11000) return res.status(409).json({ success: false, message: "That slot was just taken. Please choose another." });
-      console.error("POST /api/book:", err);
-      res.status(500).json({ success: false, message: "Server error" });
-    }
-  }
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/availability?date=YYYY-MM-DD  — public
-// ─────────────────────────────────────────────────────────────────────────────
-router.get(
-  "/availability",
-  [query("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("date must be YYYY-MM-DD")],
-  handleValidation,
-  async (req, res) => {
-    try {
-      const { date } = req.query;
-      const booked = await Booking.find({ date, status: { $nin: ["cancelled"] } }, { time: 1, _id: 0 });
-      const bookedTimes = new Set(booked.map(b => b.time));
-
-      const now = new Date();
-      const isToday = date === now.toISOString().slice(0, 10);
-      const currentMinutes = isToday ? now.getHours() * 60 + now.getMinutes() : -1;
-
-      const available = ALL_SLOTS.filter(slot => {
-        if (bookedTimes.has(slot)) return false;
-        if (isToday && toMinutes(slot) <= currentMinutes) return false;
-        return true;
-      });
-
-      res.json({ success: true, date, available, booked: [...bookedTimes] });
     } catch (err) {
       console.error("GET /api/availability:", err);
       res.status(500).json({ success: false, message: "Server error" });
@@ -121,33 +114,134 @@ router.get(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/queue  — public: position + wait time for customer
+// GET /api/queue
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/queue", async (req, res) => {
   try {
     const { date, bookingId } = req.query;
-    if (!date || !bookingId) return res.status(400).json({ success: false, message: "date and bookingId required" });
+    if (!date || !bookingId)
+      return res.status(400).json({ success: false, message: "date and bookingId required" });
 
-    const active = await Booking.find({ date, status: { $in: ["pending","confirmed","waitlist"] } }).sort({ time: 1 });
-    const myIndex = active.findIndex(b => b._id.toString() === bookingId);
+    const active = await Booking.find(
+      { date, status: { $in: ["pending", "confirmed", "waitlist"] } },
+      { time: 1, _id: 1 }
+    ).sort({ time: 1 });
 
-    if (myIndex === -1) return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are up next!" });
+    const myIndex = active.findIndex((b) => b._id.toString() === bookingId);
+    if (myIndex === -1)
+      return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are next!" });
 
-    const position    = myIndex;
-    const waitMinutes = position * 40;
-
+    const waitMinutes = myIndex * 40;
     res.json({
-      success: true, position, waitMinutes, totalInQueue: active.length,
-      message: position === 0 ? "You are next!" : `${position} customer${position > 1 ? "s" : ""} ahead of you. Est. wait: ${waitMinutes} min`,
+      success:      true,
+      position:     myIndex,
+      waitMinutes,
+      totalInQueue: active.length,
+      message:
+        myIndex === 0
+          ? "You are next!"
+          : `${myIndex} customer${myIndex > 1 ? "s" : ""} ahead · Est. wait: ${waitMinutes} min`,
     });
   } catch (err) {
-    console.error("GET /api/queue:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/bookings  — admin only
+// POST /api/book  — public
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  "/book",
+  [
+    body("firstName")
+      .trim().notEmpty().withMessage("First name required")
+      .isLength({ max: 60 }).escape(),
+    body("lastName")
+      .trim().notEmpty().withMessage("Last name required")
+      .isLength({ max: 60 }).escape(),
+    body("phone")
+      .trim().notEmpty()
+      .matches(/^[\d\s\-\(\)\+]{7,20}$/).withMessage("Invalid phone number"),
+    body("service")
+      .isIn(ALL_SERVICES).withMessage("Invalid service"),
+    body("customService").optional().trim().isLength({ max: 300 }).escape(),
+    body("date")
+      .trim()
+      .matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Date must be YYYY-MM-DD")
+      .custom((val) => {
+        if (!getHoursForDate(val))
+          throw new Error("Roadstar Tire is closed on this day.");
+        return true;
+      }),
+    body("time").trim().notEmpty().withMessage("Time slot required"),
+    body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
+    body("doesntKnowTireSize").optional().isBoolean(),
+  ],
+  handleValidation,
+  async (req, res) => {
+    try {
+      const {
+        firstName, lastName, phone,
+        service, customService,
+        date, time,
+        tireSize, doesntKnowTireSize,
+      } = req.body;
+
+      const { duration, usesJack } = resolveService(service);
+
+      // Server-side capacity re-validation (prevents race-condition overbooking)
+      const cap = await validateCapacity(date, time, service, Booking, null);
+      if (!cap.ok) {
+        return res.status(409).json({ success: false, message: cap.reason });
+      }
+
+      const booking = await Booking.create({
+        firstName, lastName, phone,
+        service,
+        customService: customService || "",
+        date, time, duration, usesJack,
+        tireSize:           tireSize || "",
+        doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
+        status: "pending",
+      });
+
+      // Emit Socket.io event
+      if (req.io) {
+        req.io.emit("new_booking", {
+          id:                booking._id,
+          customer:          booking.customer,
+          service:           booking.service,
+          customService:     booking.customService,
+          date:              booking.date,
+          time:              booking.time,
+          phone:             booking.phone,
+          status:            booking.status,
+          tireSize:          booking.tireSize,
+          doesntKnowTireSize: booking.doesntKnowTireSize,
+        });
+      }
+
+      res.status(201).json({
+        success: true,
+        message: "Booking created",
+        booking: {
+          id:       booking._id,
+          customer: booking.customer,
+          service:  booking.service,
+          date:     booking.date,
+          time:     booking.time,
+          status:   booking.status,
+        },
+      });
+    } catch (err) {
+      console.error("POST /api/book:", err);
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/bookings  — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/bookings", adminAuth, async (req, res) => {
   try {
@@ -157,65 +251,162 @@ router.get("/bookings", adminAuth, async (req, res) => {
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
     res.json({ success: true, count: bookings.length, bookings });
   } catch (err) {
-    console.error("GET /api/bookings:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /api/bookings/:id  — admin only
-// Auto-sends SMS when status changes to confirmed / completed / cancelled
+// GET /api/customers  — admin: grouped customer history
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/customers", adminAuth, async (req, res) => {
+  try {
+    const { search } = req.query;
+    const query = {};
+
+    if (search) {
+      const re = new RegExp(
+        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      );
+      query.$or = [{ firstName: re }, { lastName: re }, { phone: re }];
+    }
+
+    const bookings = await Booking.find(query)
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Group by phone → customer profile
+    const map = {};
+    for (const b of bookings) {
+      const key = b.phone;
+      if (!map[key]) {
+        map[key] = {
+          phone:       b.phone,
+          firstName:   b.firstName,
+          lastName:    b.lastName,
+          visitCount:  0,
+          bookings:    [],
+          tireSizes:   new Set(),
+          services:    new Set(),
+          lastVisit:   b.date,
+        };
+      }
+      const c = map[key];
+      c.visitCount++;
+      c.bookings.push(b);
+      c.services.add(b.service);
+      if (b.tireSize) c.tireSizes.add(b.tireSize);
+      if (b.doesntKnowTireSize && !b.tireSize) c.tireSizes.add("Doesn't know size");
+      if (b.date > c.lastVisit) c.lastVisit = b.date;
+    }
+
+    const customers = Object.values(map)
+      .map((c) => ({
+        ...c,
+        tireSizes: [...c.tireSizes],
+        services:  [...c.services],
+      }))
+      .sort((a, b) => b.visitCount - a.visitCount);
+
+    res.json({ success: true, count: customers.length, customers });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/bookings/:id  — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.patch(
   "/bookings/:id",
   adminAuth,
   [
-    param("id").isMongoId().withMessage("Invalid ID"),
-    body("status").optional().isIn(["pending","confirmed","waitlist","completed","cancelled"]),
-    body("notes").optional().trim().isLength({ max: 500 }).escape(),
-    body("time").optional().isIn(ALL_SLOTS),
+    param("id").isMongoId(),
+    body("status")
+      .optional()
+      .isIn(["pending", "confirmed", "waitlist", "completed", "cancelled"]),
+    body("notes").optional().trim().isLength({ max: 1000 }).escape(),
+    body("time").optional().trim(),
     body("date").optional().matches(/^\d{4}-\d{2}-\d{2}$/),
     body("sendSMS").optional().isBoolean(),
+    body("completedSmsVariant")
+      .optional()
+      .isIn(["with_review", "without_review", "none"]),
+    body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
+    body("doesntKnowTireSize").optional().isBoolean(),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, notes, time, date, sendSMS: triggerSMS } = req.body;
+      const {
+        status,
+        notes,
+        time,
+        date,
+        sendSMS: triggerSMS,
+        completedSmsVariant,
+        tireSize,
+        doesntKnowTireSize,
+      } = req.body;
 
+      // Validate capacity if rescheduling
       if (time || date) {
         const current = await Booking.findById(id);
-        if (!current) return res.status(404).json({ success: false, message: "Not found" });
-        const conflict = await Booking.findOne({
-          date: date || current.date, time: time || current.time,
-          _id: { $ne: id }, status: { $nin: ["cancelled"] },
-        });
-        if (conflict) return res.status(409).json({ success: false, message: "That slot is already taken." });
+        if (!current)
+          return res.status(404).json({ success: false, message: "Booking not found" });
+
+        const newDate = date || current.date;
+        const newTime = time || current.time;
+        const cap = await validateCapacity(newDate, newTime, current.service, Booking, id);
+        if (!cap.ok)
+          return res.status(409).json({ success: false, message: cap.reason });
       }
 
       const updates = {};
-      if (status !== undefined) updates.status = status;
-      if (notes  !== undefined) updates.notes  = notes;
-      if (time   !== undefined) updates.time   = time;
-      if (date   !== undefined) updates.date   = date;
+      if (status    !== undefined) updates.status = status;
+      if (notes     !== undefined) updates.notes  = notes;
+      if (time      !== undefined) updates.time   = time;
+      if (date      !== undefined) updates.date   = date;
+      if (tireSize  !== undefined) updates.tireSize = tireSize;
+      if (doesntKnowTireSize !== undefined)
+        updates.doesntKnowTireSize = doesntKnowTireSize;
+      if (completedSmsVariant !== undefined)
+        updates.completedSmsVariant = completedSmsVariant;
       if (status === "completed") updates.completedAt = new Date();
 
-      const updated = await Booking.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-      if (!updated) return res.status(404).json({ success: false, message: "Not found" });
+      const updated = await Booking.findByIdAndUpdate(
+        id,
+        { $set: updates },
+        { new: true, runValidators: true }
+      );
+      if (!updated)
+        return res.status(404).json({ success: false, message: "Booking not found" });
 
-      // Auto-SMS on key status changes
+      // ── Auto-SMS ─────────────────────────────────────────────────────────
       let smsSent = false;
-      if (status && ["confirmed","completed","cancelled"].includes(status) && triggerSMS !== false) {
-        try {
-          const msgKey = status === "cancelled" ? "declined" : status;
-          const msg = smsTemplates[msgKey]?.(updated);
-          if (msg) {
+      if (status && triggerSMS !== false) {
+        let msg = null;
+
+        if (status === "confirmed") msg = sms.confirmed(updated);
+        if (status === "cancelled") msg = sms.declined(updated);
+
+        if (status === "completed") {
+          if (completedSmsVariant === "with_review")
+            msg = sms.completed_review(updated);
+          else if (completedSmsVariant === "without_review")
+            msg = sms.completed_no_review(updated);
+          // "none" → no SMS, intentional
+        }
+
+        if (msg) {
+          try {
             await sendTwilioSMS(updated.phone, msg);
             await Booking.findByIdAndUpdate(id, { $set: { smsSentAt: new Date() } });
             smsSent = true;
+          } catch (smsErr) {
+            console.error("[SMS] Auto-send failed:", smsErr.message);
           }
-        } catch (smsErr) {
-          console.error("[SMS] Auto-send failed:", smsErr.message);
         }
       }
 
@@ -230,7 +421,7 @@ router.patch(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/bookings/:id  — admin only
+// DELETE /api/bookings/:id  — admin
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete(
   "/bookings/:id",
@@ -240,46 +431,49 @@ router.delete(
   async (req, res) => {
     try {
       const deleted = await Booking.findByIdAndDelete(req.params.id);
-      if (!deleted) return res.status(404).json({ success: false, message: "Not found" });
+      if (!deleted)
+        return res.status(404).json({ success: false, message: "Booking not found" });
       if (req.io) req.io.emit("booking_deleted", { id: req.params.id });
       res.json({ success: true, message: "Booking deleted" });
     } catch (err) {
-      console.error("DELETE /api/bookings/:id:", err);
       res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/bookings/:id/sms  — admin only: manual SMS
+// POST /api/bookings/:id/sms  — admin: manual SMS
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
   "/bookings/:id/sms",
   adminAuth,
   [
     param("id").isMongoId(),
-    body("messageType").isIn(["confirmed","declined","waitlist","reminder","completed"]),
+    body("messageType").isIn([
+      "confirmed", "declined", "waitlist", "reminder",
+      "completed_review", "completed_no_review",
+    ]),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const booking = await Booking.findById(req.params.id);
-      if (!booking) return res.status(404).json({ success: false, message: "Not found" });
+      if (!booking)
+        return res.status(404).json({ success: false, message: "Not found" });
 
-      if (!process.env.TWILIO_ACCOUNT_SID) {
-        return res.status(503).json({ success: false, message: "Twilio not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER to Render env vars." });
-      }
+      if (!process.env.TWILIO_ACCOUNT_SID)
+        return res.status(503).json({ success: false, message: "Twilio not configured" });
 
-      const msg = smsTemplates[req.body.messageType]?.(booking);
-      if (!msg) return res.status(400).json({ success: false, message: "Invalid message type" });
+      const fn  = sms[req.body.messageType];
+      if (!fn)
+        return res.status(400).json({ success: false, message: "Invalid message type" });
 
+      const msg     = fn(booking);
       const message = await sendTwilioSMS(booking.phone, msg);
       await Booking.findByIdAndUpdate(req.params.id, { $set: { smsSentAt: new Date() } });
 
-      console.log(`[SMS] Sent to ${booking.phone} — SID: ${message?.sid}`);
       res.json({ success: true, message: `SMS sent to ${booking.phone}`, sid: message?.sid });
     } catch (err) {
-      console.error("[SMS] Error:", err.message);
       res.status(500).json({ success: false, message: err.message || "SMS failed" });
     }
   }
