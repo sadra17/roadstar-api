@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// routes/bookings.js  v7
+// routes/bookings.js  v7.2
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
@@ -12,15 +12,14 @@ const adminAuth = require("../middleware/adminAuth");
 const { handleValidation } = require("../middleware/validate");
 const {
   ALL_SERVICES, SERVICE_DEFS, HOURS, RESOURCE_POOLS,
-  resolveService, effectiveOccupation,
+  resolveService, resolvedDuration, resolvedOccupation, effectiveOccupation,
   computeAvailability, validateCapacity, getHoursForDate,
   display12To24, toMinutes,
 } = require("../config/business");
 
-// ── Google review link ────────────────────────────────────────────────────────
 const GOOGLE_REVIEW = "https://g.page/r/CYPKn0GrR0t3EBM/review";
 
-// ── Twilio helper ─────────────────────────────────────────────────────────────
+// ── Twilio ────────────────────────────────────────────────────────────────────
 async function sendTwilioSMS(to, body) {
   if (!process.env.TWILIO_ACCOUNT_SID) {
     console.warn("[SMS] Twilio not configured — skipping");
@@ -33,7 +32,6 @@ async function sendTwilioSMS(to, body) {
   return client.messages.create({ body, from: process.env.TWILIO_PHONE_NUMBER, to });
 }
 
-// ── SMS templates ─────────────────────────────────────────────────────────────
 function svcLabel(b) {
   return b.service === "Other" && b.customService
     ? `Other — ${b.customService}` : b.service;
@@ -42,20 +40,15 @@ function svcLabel(b) {
 const sms = {
   confirmed: (b) =>
     `Hi ${b.firstName}! Your Roadstar Tire appointment is CONFIRMED for ${b.date} at ${b.time} (${svcLabel(b)}). See you soon! — Roadstar Tire`,
-
   declined: (b) =>
     `Hi ${b.firstName}, we had to cancel your ${b.time} appointment on ${b.date}. Please call us to reschedule. — Roadstar Tire`,
-
   waitlist: (b) =>
     `Hi ${b.firstName}! A spot just opened at Roadstar Tire on ${b.date}. Call us to claim it! — Roadstar Tire`,
-
   reminder: (b) =>
     `Hi ${b.firstName}, reminder: your Roadstar Tire appointment is TODAY at ${b.time} for ${svcLabel(b)}. See you soon! — Roadstar Tire`,
-
-  // FIXED: review link at the very bottom, preceded by required sentence
+  // Review link at the very bottom, required sentence before it
   completed_review: (b) =>
     `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${svcLabel(b)}. Drive safe!\n\nClick the link to leave us a review\n${GOOGLE_REVIEW}`,
-
   completed_no_review: (b) =>
     `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${svcLabel(b)}. Drive safe! — Roadstar Tire`,
 };
@@ -63,15 +56,19 @@ const sms = {
 // ── GET /api/business-hours ───────────────────────────────────────────────────
 router.get("/business-hours", (_req, res) => {
   res.json({
-    success:     true,
-    hours:       HOURS,
-    services:    ALL_SERVICES,
-    serviceDefs: SERVICE_DEFS,
+    success:       true,
+    hours:         HOURS,
+    services:      ALL_SERVICES,
+    serviceDefs:   SERVICE_DEFS,
     resourcePools: RESOURCE_POOLS,
   });
 });
 
 // ── GET /api/availability ─────────────────────────────────────────────────────
+// Returns { available, full, allSlots } so UI can show full slots grayed out.
+// available  = times that can still be booked
+// full       = times at capacity (grayed out, not hidden)
+// allSlots   = all future times for the day in order (available + full combined)
 router.get(
   "/availability",
   [
@@ -102,7 +99,10 @@ router.post(
     body("customService").optional().trim().isLength({ max: 300 }).escape(),
     body("date")
       .trim().matches(/^\d{4}-\d{2}-\d{2}$/).withMessage("Invalid date.")
-      .custom(val => { if (!getHoursForDate(val)) throw new Error("Roadstar Tire is closed on this day."); return true; }),
+      .custom(val => {
+        if (!getHoursForDate(val)) throw new Error("Roadstar Tire is closed on this day.");
+        return true;
+      }),
     body("time").trim().notEmpty().withMessage("Please select a time slot."),
     body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
@@ -113,12 +113,10 @@ router.post(
       const { firstName, lastName, phone, service, customService, date, time, tireSize, doesntKnowTireSize } = req.body;
 
       const def = resolveService(service);
-      const occ = effectiveOccupation(def);
 
-      // Server-side capacity re-validation (race-condition guard)
+      // Server-side capacity validation — prevents race-condition double-booking
       const cap = await validateCapacity(date, time, service, Booking, null);
       if (!cap.ok) {
-        // Clean user-facing message — never raw errors
         return res.status(409).json({ success: false, message: cap.reason });
       }
 
@@ -150,19 +148,21 @@ router.post(
       res.status(201).json({
         success: true,
         message: "Booking created successfully.",
-        booking: { id: booking._id, customer: booking.customer, service: booking.service, date: booking.date, time: booking.time, status: booking.status },
+        booking: {
+          id: booking._id, customer: booking.customer,
+          service: booking.service, date: booking.date,
+          time: booking.time, status: booking.status,
+        },
       });
     } catch (err) {
       console.error("POST /api/book:", err);
-      // Catch MongoDB duplicate key error (E11000) — means old unique index still exists in DB.
-      // Treat it as a capacity conflict so the user gets a clean message.
+      // E11000 = old unique index still exists in MongoDB — treat as capacity conflict
       if (err.code === 11000) {
         return res.status(409).json({
           success: false,
           message: "That time is no longer available. Please choose another time.",
         });
       }
-      // Never expose raw errors to customers
       res.status(500).json({ success: false, message: "Something went wrong. Please try again or call us directly." });
     }
   }
@@ -176,18 +176,20 @@ router.get("/bookings", adminAuth, async (req, res) => {
     if (req.query.date)   filter.date   = req.query.date;
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
 
-    // Enrich old bookings that have service_duration=10 (schema default) but aren't Tire Purchase.
-    // This handles bookings created before service_duration was denormalized.
+    // Enrich bookings where service_duration was saved as schema default (10)
+    // for services that are not actually 10 minutes.
     const enriched = bookings.map(b => {
       const obj = b.toJSON();
       const def = resolveService(b.service);
-      // Fix any booking where service_duration looks wrong (is schema default 10 but service isn't 10-min)
-      const needsEnrich = !b.service_duration 
+      const needsEnrich =
+        !b.service_duration
         || (b.service_duration === 10 && b.service !== "Tire Purchase")
-        || !b.resourcePool || b.resourcePool === "none" && def.resourcePool !== "none";
+        || !b.resourcePool
+        || (b.resourcePool === "none" && def.resourcePool !== "none");
       if (needsEnrich) {
         obj.service_duration        = def.service_duration;
-        obj.equipment_recovery_time = b.equipment_recovery_time !== undefined ? b.equipment_recovery_time : def.equipment_recovery_time;
+        obj.equipment_recovery_time = b.equipment_recovery_time !== undefined
+          ? b.equipment_recovery_time : def.equipment_recovery_time;
         obj.resourcePool            = def.resourcePool;
       }
       return obj;
@@ -212,7 +214,10 @@ router.get("/customers", adminAuth, async (req, res) => {
     const map = {};
     for (const b of bookings) {
       const key = b.phone;
-      if (!map[key]) map[key] = { phone: b.phone, firstName: b.firstName, lastName: b.lastName, visitCount: 0, bookings: [], tireSizes: new Set(), services: new Set(), lastVisit: b.date };
+      if (!map[key]) map[key] = {
+        phone: b.phone, firstName: b.firstName, lastName: b.lastName,
+        visitCount: 0, bookings: [], tireSizes: new Set(), services: new Set(), lastVisit: b.date,
+      };
       const c = map[key];
       c.visitCount++;
       c.bookings.push(b);
@@ -231,6 +236,8 @@ router.get("/customers", adminAuth, async (req, res) => {
 });
 
 // ── GET /api/live-bay — admin ─────────────────────────────────────────────────
+// Uses resolvedOccupation() so correct service durations are used even for
+// old records that have service_duration=10 (schema default).
 router.get("/live-bay", adminAuth, async (req, res) => {
   try {
     const { DateTime } = require("luxon");
@@ -239,44 +246,62 @@ router.get("/live-bay", adminAuth, async (req, res) => {
     const todayStr = now.toISODate();
     const nowMins  = now.hour * 60 + now.minute;
 
+    // Get all confirmed bookings for today (includes both bay and alignment)
     const todayConfirmed = await Booking.find({
-      date: todayStr, status: "confirmed",
+      date:   todayStr,
+      status: "confirmed",
     }).sort({ time: 1 }).lean();
 
-    const active = [];
+    const active   = [];
     const upcoming = [];
 
     for (const b of todayConfirmed) {
       if (b.resourcePool === "none") continue;
+
       const s24 = display12To24(b.time);
       if (!s24) continue;
+
       const startM = toMinutes(s24);
-      const occ    = (b.service_duration || 10) + (b.equipment_recovery_time || 0);
+      // Use resolvedOccupation — uses config duration as authoritative source
+      const occ    = resolvedOccupation(b);
       const endM   = startM + occ;
 
       if (nowMins >= startM && nowMins < endM) {
-        active.push({ ...b, minutesRemaining: endM - nowMins });
+        active.push({
+          ...b,
+          minutesRemaining: endM - nowMins,
+          // Expose the correct duration for display
+          _resolvedDuration: occ,
+        });
       } else if (startM > nowMins) {
         upcoming.push(b);
       }
     }
 
-    // Assign bay numbers chronologically (stable sort by time)
+    // Assign bay numbers to normal bay bookings chronologically.
+    // Alignment bookings get their own dedicated lane label.
     let normalBayCounter = 1;
     const activeBays = active.map(b => {
-      if (b.resourcePool === "alignment") return { ...b, assignedBay: "alignment" };
+      if (b.resourcePool === "alignment") {
+        return { ...b, assignedBay: "alignment" };
+      }
       const bn = b.bayNumber || normalBayCounter++;
       return { ...b, assignedBay: bn };
     });
 
-    res.json({ success: true, active: activeBays, upcoming: upcoming.slice(0, 6), now: now.toISO() });
+    res.json({
+      success:  true,
+      active:   activeBays,
+      upcoming: upcoming.slice(0, 6),
+      now:      now.toISO(),
+    });
   } catch (err) {
     console.error("GET /api/live-bay:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ── PATCH /api/bookings/:id/bay-snooze — admin ────────────────────────────────
+// ── PATCH /api/bookings/:id/bay-snooze ───────────────────────────────────────
 router.patch("/bookings/:id/bay-snooze", adminAuth, async (req, res) => {
   try {
     const { DateTime } = require("luxon");
@@ -294,7 +319,7 @@ router.patch("/bookings/:id/bay-snooze", adminAuth, async (req, res) => {
   }
 });
 
-// ── PATCH /api/bookings/:id — admin ───────────────────────────────────────────
+// ── PATCH /api/bookings/:id — admin ──────────────────────────────────────────
 router.patch(
   "/bookings/:id",
   adminAuth,
@@ -309,15 +334,16 @@ router.patch(
     body("tireSize").optional().trim().isLength({ max: 50 }).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
     body("bayNumber").optional().isInt({ min: 1, max: 3 }),
-    body("notes").optional().trim().isLength({ max: 1000 }).escape(),
   ],
   handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, notes, time, date, sendSMS: triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, bayNumber } = req.body;
+      const {
+        status, notes, time, date, sendSMS: triggerSMS,
+        completedSmsVariant, tireSize, doesntKnowTireSize, bayNumber,
+      } = req.body;
 
-      // Capacity check when rescheduling
       if (time || date) {
         const current = await Booking.findById(id);
         if (!current) return res.status(404).json({ success: false, message: "Booking not found." });
@@ -341,20 +367,16 @@ router.patch(
       const updated = await Booking.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
       if (!updated) return res.status(404).json({ success: false, message: "Booking not found." });
 
-      // ── Auto-SMS ─────────────────────────────────────────────────────────────
+      // Auto-SMS on status change
       let smsSent = false;
       if (status && triggerSMS !== false) {
         let msg = null;
         if (status === "confirmed") msg = sms.confirmed(updated);
         if (status === "cancelled") msg = sms.declined(updated);
-
-        // FIXED: completedSmsVariant mapping — covers both "with_review" and "without_review"
         if (status === "completed") {
           if (completedSmsVariant === "with_review")    msg = sms.completed_review(updated);
           else if (completedSmsVariant === "without_review") msg = sms.completed_no_review(updated);
-          // "none" → no SMS, intentional
         }
-
         if (msg) {
           try {
             await sendTwilioSMS(updated.phone, msg);
@@ -376,7 +398,7 @@ router.patch(
   }
 );
 
-// ── DELETE /api/bookings/:id — admin ──────────────────────────────────────────
+// ── DELETE /api/bookings/:id ──────────────────────────────────────────────────
 router.delete(
   "/bookings/:id",
   adminAuth,
@@ -394,7 +416,7 @@ router.delete(
   }
 );
 
-// ── POST /api/bookings/:id/sms — admin (manual) ───────────────────────────────
+// ── POST /api/bookings/:id/sms — manual ──────────────────────────────────────
 router.post(
   "/bookings/:id/sms",
   adminAuth,
@@ -409,14 +431,11 @@ router.post(
       if (!booking) return res.status(404).json({ success: false, message: "Not found" });
       if (!process.env.TWILIO_ACCOUNT_SID)
         return res.status(503).json({ success: false, message: "Twilio not configured." });
-
       const fn = sms[req.body.messageType];
       if (!fn) return res.status(400).json({ success: false, message: "Invalid message type." });
-
       const msg     = fn(booking);
       const message = await sendTwilioSMS(booking.phone, msg);
       await Booking.findByIdAndUpdate(req.params.id, { $set: { smsSentAt: new Date() } });
-      console.log(`[SMS] Manual (${req.body.messageType}) → ${booking.phone} SID:${message?.sid}`);
       res.json({ success: true, message: `SMS sent to ${booking.phone}`, sid: message?.sid });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message || "SMS failed" });
@@ -436,9 +455,10 @@ router.get("/queue", async (req, res) => {
     ).sort({ time: 1 });
     const idx = active.findIndex(b => b._id.toString() === bookingId);
     if (idx === -1) return res.json({ success: true, position: 0, waitMinutes: 0, message: "You are next!" });
-    const waitMinutes = idx * 40;
-    res.json({ success: true, position: idx, waitMinutes, totalInQueue: active.length,
-      message: idx === 0 ? "You are next!" : `${idx} customer${idx>1?"s":""} ahead — est. wait: ${waitMinutes} min` });
+    res.json({
+      success: true, position: idx, waitMinutes: idx * 40, totalInQueue: active.length,
+      message: idx === 0 ? "You are next!" : `${idx} customer${idx>1?"s":""} ahead — est. wait: ${idx*40} min`,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: "Server error" });
   }
