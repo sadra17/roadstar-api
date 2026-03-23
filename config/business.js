@@ -192,7 +192,15 @@ function occupancyDuring(bookings, newStart24, newOccupation, resourcePool) {
     if (b.resourcePool !== resourcePool) continue;
     const bs24 = display12To24(b.time) || b.time;
     const bs   = toMinutes(bs24);
-    const occ  = (b.service_duration || 10) + (b.equipment_recovery_time || 0);
+    // Use stored service_duration UNLESS it looks like the schema default (10)
+    // for a service that isn't actually 10 minutes. Fall back to config truth.
+    // This handles bookings created before service_duration was properly denormalized.
+    const def = resolveService(b.service || "");
+    const storedDur = b.service_duration;
+    const dur = (storedDur && storedDur > 10) ? storedDur
+               : (storedDur === 10 && def.service_duration === 10) ? 10
+               : def.service_duration;
+    const occ  = dur + (b.equipment_recovery_time || def.equipment_recovery_time || 0);
     const be   = bs + occ;
     if (ns < be && ne > bs) {
       total += (b.customer_quantity || 1);
@@ -221,7 +229,7 @@ async function computeAvailability(dateStr, serviceName, Booking) {
       status:       { $in: CAPACITY_BLOCKING_STATUSES },
       resourcePool: { $ne: "none" },
     },
-    { time: 1, service_duration: 1, equipment_recovery_time: 1,
+    { time: 1, service: 1, service_duration: 1, equipment_recovery_time: 1,
       resourcePool: 1, customer_quantity: 1, _id: 0 }
   ).lean();
 
@@ -270,7 +278,7 @@ async function validateCapacity(dateStr, slot, serviceName, Booking, excludeId) 
 
   const existing = await Booking.find(
     q,
-    { time: 1, service_duration: 1, equipment_recovery_time: 1,
+    { time: 1, service: 1, service_duration: 1, equipment_recovery_time: 1,
       resourcePool: 1, customer_quantity: 1, _id: 0 }
   ).lean();
 

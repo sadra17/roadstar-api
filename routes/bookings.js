@@ -181,10 +181,14 @@ router.get("/bookings", adminAuth, async (req, res) => {
     const enriched = bookings.map(b => {
       const obj = b.toJSON();
       const def = resolveService(b.service);
-      if (b.service !== "Tire Purchase" && (b.service_duration === 10 || !b.service_duration)) {
+      // Fix any booking where service_duration looks wrong (is schema default 10 but service isn't 10-min)
+      const needsEnrich = !b.service_duration 
+        || (b.service_duration === 10 && b.service !== "Tire Purchase")
+        || !b.resourcePool || b.resourcePool === "none" && def.resourcePool !== "none";
+      if (needsEnrich) {
         obj.service_duration        = def.service_duration;
-        obj.equipment_recovery_time = b.equipment_recovery_time || def.equipment_recovery_time;
-        obj.resourcePool            = b.resourcePool || def.resourcePool;
+        obj.equipment_recovery_time = b.equipment_recovery_time !== undefined ? b.equipment_recovery_time : def.equipment_recovery_time;
+        obj.resourcePool            = def.resourcePool;
       }
       return obj;
     });
