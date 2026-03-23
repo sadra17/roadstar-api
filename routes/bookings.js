@@ -154,6 +154,14 @@ router.post(
       });
     } catch (err) {
       console.error("POST /api/book:", err);
+      // Catch MongoDB duplicate key error (E11000) — means old unique index still exists in DB.
+      // Treat it as a capacity conflict so the user gets a clean message.
+      if (err.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: "That time is no longer available. Please choose another time.",
+        });
+      }
       // Never expose raw errors to customers
       res.status(500).json({ success: false, message: "Something went wrong. Please try again or call us directly." });
     }
