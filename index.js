@@ -30,10 +30,17 @@ app.options("*", cors());
 app.use(express.json({ limit: "10kb" }));
 app.use(morgan("dev"));
 
-const rl = (max, msg) => rateLimit({ windowMs:15*60_000, max, standardHeaders:true, legacyHeaders:false, message:{success:false,message:msg||"Too many requests."} });
-app.use("/api/book",       rl(20, "Too many booking attempts. Try again later."));
-app.use("/api/auth/login", rl(10));
-app.use("/api",            rl(500));
+const rl = (windowMs, max, msg) => rateLimit({
+  windowMs, max,
+  standardHeaders: true, legacyHeaders: false,
+  message: { success: false, message: msg || "Too many requests. Please wait a moment." },
+});
+// /api/book: 60 attempts per 15 min per IP — enough for real customers and staff testing
+app.use("/api/book",       rl(15*60_000, 60, "Too many booking attempts. Please wait a moment and try again."));
+// Login: 15 per 15 min
+app.use("/api/auth/login", rl(15*60_000, 15));
+// Everything else: 1000 per 15 min (admin dashboard polling etc.)
+app.use("/api",            rl(15*60_000, 1000));
 
 app.use("/api/auth", authRoutes);
 app.use("/api",      bookingRoutes);

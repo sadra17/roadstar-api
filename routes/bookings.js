@@ -167,7 +167,21 @@ router.get("/bookings", adminAuth, async (req, res) => {
     if (req.query.status) filter.status = req.query.status;
     if (req.query.date)   filter.date   = req.query.date;
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
-    res.json({ success: true, count: bookings.length, bookings });
+
+    // Enrich old bookings that have service_duration=10 (schema default) but aren't Tire Purchase.
+    // This handles bookings created before service_duration was denormalized.
+    const enriched = bookings.map(b => {
+      const obj = b.toJSON();
+      const def = resolveService(b.service);
+      if (b.service !== "Tire Purchase" && (b.service_duration === 10 || !b.service_duration)) {
+        obj.service_duration        = def.service_duration;
+        obj.equipment_recovery_time = b.equipment_recovery_time || def.equipment_recovery_time;
+        obj.resourcePool            = b.resourcePool || def.resourcePool;
+      }
+      return obj;
+    });
+
+    res.json({ success: true, count: enriched.length, bookings: enriched });
   } catch (err) {
     res.status(500).json({ success: false, message: "Server error" });
   }
