@@ -1,18 +1,25 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// config/business.js  v6
-// Single source of truth for all Roadstar Tire business rules.
+// config/business.js  v7
+//
+// Core scheduling parameters:
+//   parallel_capacity      – how many simultaneous bookings a pool accepts
+//   service_duration       – how long the service takes (minutes)
+//   equipment_recovery_time – cooldown after service before next booking (minutes)
+//   customer_quantity      – how many capacity units one booking consumes (default 1)
+//
+// effective_occupation = service_duration + equipment_recovery_time
+// remaining_capacity   = parallel_capacity − Σ(customer_quantity of overlapping confirmed bookings)
+// slot available when  remaining_capacity ≥ requested_quantity (always 1 from UI)
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
 const { DateTime } = require("luxon");
 
-const TZ           = "America/Toronto";
-const NORMAL_BAYS  = 3;   // normal service bays (jacks)
-const ALIGN_LANES  = 1;   // wheel alignment lane (separate capacity)
-const SLOT_INTERVAL = 15; // minutes between slot start times
+// ── Timezone ──────────────────────────────────────────────────────────────────
+const TZ = "America/Toronto";
 
 // ── Business hours ────────────────────────────────────────────────────────────
-// 0=Sun, 1=Mon … 6=Sat.  null = closed all day.
+// 0=Sun, 1=Mon … 6=Sat. null = closed.
 const HOURS = {
   0: null,
   1: { open: "09:00", close: "18:00" },
@@ -23,51 +30,114 @@ const HOURS = {
   6: { open: "09:30", close: "16:00" },
 };
 
-// ── Service catalog ───────────────────────────────────────────────────────────
-// capacityType:
-//   "bay"       → uses 1 of 3 normal bays
-//   "alignment" → uses the 1 alignment lane
-//   "none"      → no capacity consumed
-const SERVICE_DEFS = {
-  "Tire Change + Installation": { duration: 40, capacityType: "bay"       },
-  "Flat Tire Repair":           { duration: 15, capacityType: "bay"       },
-  "Tire Rotation":              { duration: 20, capacityType: "bay"       },
-  "Wheel Alignment":            { duration: 60, capacityType: "alignment" },
-  "Tire Purchase":              { duration: 10, capacityType: "none"      },
-  "Other":                      { duration: 30, capacityType: "none"      }, // admin-safe default
+// ── Resource pools ────────────────────────────────────────────────────────────
+// resourcePool drives which capacity bucket a booking consumes.
+// "bay"       → shared normal bay pool (3 jacks)
+// "alignment" → independent alignment lane (1)
+// "none"      → no capacity consumed; always bookable
+const RESOURCE_POOLS = {
+  bay: {
+    parallel_capacity: 3,   // global default; can be overridden per slot
+    label: "Normal bay",
+  },
+  alignment: {
+    parallel_capacity: 1,
+    label: "Alignment lane",
+  },
+  none: {
+    parallel_capacity: Infinity,
+    label: "No bay required",
+  },
 };
 
-const ALL_SERVICES = Object.keys(SERVICE_DEFS);
+// ── Service definitions ───────────────────────────────────────────────────────
+// service_duration         – minutes of actual work
+// equipment_recovery_time  – minutes the bay must rest before next booking
+// resourcePool             – which pool this service draws from
+const SERVICE_DEFS = {
+  "Tire Change + Installation": {
+    service_duration:        40,
+    equipment_recovery_time: 0,
+    resourcePool:            "bay",
+  },
+  "Flat Tire Repair": {
+    service_duration:        15,
+    equipment_recovery_time: 0,
+    resourcePool:            "bay",
+  },
+  "Tire Rotation": {
+    service_duration:        20,
+    equipment_recovery_time: 0,
+    resourcePool:            "bay",
+  },
+  "Wheel Alignment": {
+    service_duration:        60,
+    equipment_recovery_time: 0,
+    resourcePool:            "alignment",
+  },
+  "Tire Purchase": {
+    service_duration:        10,   // short display duration; no capacity consumed
+    equipment_recovery_time: 0,
+    resourcePool:            "none",
+  },
+  "Other": {
+    service_duration:        30,   // admin-safe default; configurable
+    equipment_recovery_time: 0,
+    resourcePool:            "none", // default non-bay; staff can change later
+  },
+};
 
-// ── Capacity decisions ────────────────────────────────────────────────────────
-// Use confirmed-only blocking (Option A).
-// Rationale: cleaner UX, no phantom holds, no expiry complexity.
-// Pending bookings are treated as soft holds only at the final race-condition
-// check in validateCapacity — they do NOT block availability display.
+const ALL_SERVICES  = Object.keys(SERVICE_DEFS);
+const SLOT_INTERVAL = 15; // minutes between candidate slot starts
+
+// ── Blocking statuses ─────────────────────────────────────────────────────────
+// Only confirmed bookings consume capacity.
+// Pending does NOT lock slots (Option A — confirmed-only blocking).
 const CAPACITY_BLOCKING_STATUSES = ["confirmed"];
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function resolveService(service) {
-  return SERVICE_DEFS[service] || { duration: 30, capacityType: "none" };
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Returns service def (with fallback for unknown/custom). */
+function resolveService(serviceName) {
+  return SERVICE_DEFS[serviceName] || {
+    service_duration:        30,
+    equipment_recovery_time: 0,
+    resourcePool:            "none",
+  };
 }
 
+/** Effective occupation in minutes: duration + recovery. */
+function effectiveOccupation(def) {
+  return def.service_duration + (def.equipment_recovery_time || 0);
+}
+
+/** Pool parallel_capacity (accounting for per-slot override). */
+function poolCapacity(resourcePool, slotOverride) {
+  if (slotOverride !== undefined && slotOverride !== null) return slotOverride;
+  return RESOURCE_POOLS[resourcePool]?.parallel_capacity ?? Infinity;
+}
+
+/** Returns business hours { open, close } | null for "YYYY-MM-DD". */
 function getHoursForDate(dateStr) {
   const dt  = DateTime.fromISO(dateStr, { zone: TZ });
-  const dow = dt.weekday === 7 ? 0 : dt.weekday; // luxon: 1=Mon,7=Sun → JS 0-6
+  const dow = dt.weekday === 7 ? 0 : dt.weekday; // luxon 1=Mon,7=Sun → JS 0=Sun
   return HOURS[dow] ?? null;
 }
 
+/** "HH:MM" → minutes since midnight */
 function toMinutes(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
   return h * 60 + m;
 }
 
+/** minutes → "HH:MM" */
 function fromMinutes(mins) {
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+  return `${String(Math.floor(mins / 60)).padStart(2,"0")}:${String(mins % 60).padStart(2,"0")}`;
 }
 
+/** "9:00 AM" or "HH:MM" → "HH:MM" */
 function display12To24(str) {
   if (!str) return null;
   if (/^\d{2}:\d{2}$/.test(str)) return str;
@@ -75,12 +145,12 @@ function display12To24(str) {
   if (!m) return null;
   let h = parseInt(m[1], 10);
   const mn = parseInt(m[2], 10);
-  const p  = m[3].toUpperCase();
-  if (p === "PM" && h !== 12) h += 12;
-  if (p === "AM" && h === 12) h = 0;
+  if (m[3].toUpperCase() === "PM" && h !== 12) h += 12;
+  if (m[3].toUpperCase() === "AM" && h === 12) h = 0;
   return `${String(h).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
 }
 
+/** "HH:MM" → "9:00 AM" */
 function display24To12(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
   const p   = h >= 12 ? "PM" : "AM";
@@ -88,105 +158,125 @@ function display24To12(hhmm) {
   return `${h12}:${String(m).padStart(2,"0")} ${p}`;
 }
 
-// Generates all valid start times for a service duration on a given date.
-// Returns 12h display strings.
-function generateSlots(dateStr, duration) {
+/**
+ * Generate all candidate slot start times for a service on a date.
+ * A slot is valid only if the effective_occupation fits before closing time.
+ * Returns 12-hour display strings.
+ */
+function generateSlots(dateStr, serviceName) {
   const hours = getHoursForDate(dateStr);
   if (!hours) return [];
-  const openM  = toMinutes(hours.open);
-  const closeM = toMinutes(hours.close);
-  const last   = closeM - duration;
-  const slots  = [];
+  const def     = resolveService(serviceName);
+  const occMin  = effectiveOccupation(def);
+  const openM   = toMinutes(hours.open);
+  const closeM  = toMinutes(hours.close);
+  const last    = closeM - occMin;
+  const slots   = [];
   for (let t = openM; t <= last; t += SLOT_INTERVAL) {
     slots.push(display24To12(fromMinutes(t)));
   }
   return slots;
 }
 
-// Count how many confirmed bookings of a given capacityType overlap a window.
-function countOverlapping(bookings, slot24, duration, capacityType) {
-  const ns = toMinutes(slot24);
-  const ne = ns + duration;
-  let count = 0;
+/**
+ * Count capacity consumed by existing confirmed bookings that overlap
+ * the proposed [newStart, newStart + occupation).
+ *
+ * Each booking contributes its customer_quantity (default 1).
+ */
+function occupancyDuring(bookings, newStart24, newOccupation, resourcePool) {
+  const ns = toMinutes(newStart24);
+  const ne = ns + newOccupation;
+  let total = 0;
   for (const b of bookings) {
-    if (b.capacityType !== capacityType) continue;
-    const bs = toMinutes(display12To24(b.time) || b.time);
-    const be = bs + (b.duration || 10);
-    if (ns < be && ne > bs) count++;
+    if (b.resourcePool !== resourcePool) continue;
+    const bs24 = display12To24(b.time) || b.time;
+    const bs   = toMinutes(bs24);
+    const occ  = (b.service_duration || 10) + (b.equipment_recovery_time || 0);
+    const be   = bs + occ;
+    if (ns < be && ne > bs) {
+      total += (b.customer_quantity || 1);
+    }
   }
-  return count;
+  return total;
 }
 
-// Maximum capacity for a capacityType.
-function maxCapacity(capacityType) {
-  if (capacityType === "bay")       return NORMAL_BAYS;
-  if (capacityType === "alignment") return ALIGN_LANES;
-  return Infinity; // "none" — no limit
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Main availability engine
+// ─────────────────────────────────────────────────────────────────────────────
+async function computeAvailability(dateStr, serviceName, Booking) {
+  const def          = resolveService(serviceName);
+  const occ          = effectiveOccupation(def);
+  const { resourcePool } = def;
+  const hours        = getHoursForDate(dateStr);
 
-// ── Main availability computation ─────────────────────────────────────────────
-async function computeAvailability(dateStr, service, Booking) {
-  const { duration, capacityType } = resolveService(service);
-  const hours = getHoursForDate(dateStr);
-  if (!hours) return { available: [], businessHours: null, duration, capacityType };
+  if (!hours) return { available: [], businessHours: null, def };
 
-  const candidates = generateSlots(dateStr, duration);
+  const candidates = generateSlots(dateStr, serviceName);
 
-  // Fetch CONFIRMED bookings for this date (confirmed-only blocking)
+  // Fetch confirmed bookings for this date that consume capacity
   const existing = await Booking.find(
     {
       date:         dateStr,
       status:       { $in: CAPACITY_BLOCKING_STATUSES },
-      capacityType: { $ne: "none" },
+      resourcePool: { $ne: "none" },
     },
-    { time: 1, duration: 1, capacityType: 1, _id: 0 }
+    { time: 1, service_duration: 1, equipment_recovery_time: 1,
+      resourcePool: 1, customer_quantity: 1, _id: 0 }
   ).lean();
 
-  // Strip past times (today only, Toronto time)
-  const now     = DateTime.now().setZone(TZ);
-  const isToday = dateStr === now.toISODate();
-  const nowMins = isToday ? now.hour * 60 + now.minute : -1;
+  // Strip past times for today (Toronto clock)
+  const now      = DateTime.now().setZone(TZ);
+  const isToday  = dateStr === now.toISODate();
+  const nowMins  = isToday ? now.hour * 60 + now.minute : -1;
 
-  const cap   = maxCapacity(capacityType);
-  const avail = [];
+  const cap     = poolCapacity(resourcePool); // no per-slot override at this layer
+  const avail   = [];
 
   for (const slot12 of candidates) {
     const slot24 = display12To24(slot12);
     if (!slot24) continue;
     if (isToday && toMinutes(slot24) <= nowMins) continue;
 
-    if (capacityType !== "none") {
-      const occupied = countOverlapping(existing, slot24, duration, capacityType);
-      if (occupied >= cap) continue;
+    if (resourcePool !== "none") {
+      const used = occupancyDuring(existing, slot24, occ, resourcePool);
+      if (used >= cap) continue; // full → skip
     }
-
     avail.push(slot12);
   }
 
-  return { available: avail, businessHours: hours, duration, capacityType };
+  return { available: avail, businessHours: hours, def, resourcePool, occupation: occ };
 }
 
-// ── Server-side capacity validation (race-condition guard) ────────────────────
-// Called inside POST /api/book and PATCH /api/bookings/:id when rescheduling.
-async function validateCapacity(dateStr, slot, service, Booking, excludeId) {
-  const { duration, capacityType } = resolveService(service);
-  if (capacityType === "none") return { ok: true };
+// ─────────────────────────────────────────────────────────────────────────────
+// Server-side capacity validation (race-condition guard)
+// ─────────────────────────────────────────────────────────────────────────────
+async function validateCapacity(dateStr, slot, serviceName, Booking, excludeId) {
+  const def          = resolveService(serviceName);
+  const occ          = effectiveOccupation(def);
+  const { resourcePool } = def;
+
+  if (resourcePool === "none") return { ok: true };
 
   const slot24 = display12To24(slot) || slot;
-  const cap    = maxCapacity(capacityType);
+  const cap    = poolCapacity(resourcePool);
 
   const q = {
     date:         dateStr,
     status:       { $in: CAPACITY_BLOCKING_STATUSES },
-    capacityType: capacityType,
+    resourcePool: resourcePool,
   };
   if (excludeId) q._id = { $ne: excludeId };
 
-  const existing = await Booking.find(q, { time: 1, duration: 1, capacityType: 1, _id: 0 }).lean();
-  const occupied = countOverlapping(existing, slot24, duration, capacityType);
+  const existing = await Booking.find(
+    q,
+    { time: 1, service_duration: 1, equipment_recovery_time: 1,
+      resourcePool: 1, customer_quantity: 1, _id: 0 }
+  ).lean();
 
-  if (occupied >= cap) {
-    const noun = capacityType === "alignment" ? "alignment lane" : "service bay";
+  const used = occupancyDuring(existing, slot24, occ, resourcePool);
+  if (used >= cap) {
+    const noun = resourcePool === "alignment" ? "alignment lane" : "service bay";
     return {
       ok: false,
       reason: `That time is no longer available — the ${noun} is fully booked during that window. Please choose another time.`,
@@ -195,45 +285,24 @@ async function validateCapacity(dateStr, slot, service, Booking, excludeId) {
   return { ok: true };
 }
 
-// ── "Live at bay" helper ──────────────────────────────────────────────────────
-// Returns bookings that are actively in service right now based on
-// confirmed status + time window containing current Toronto time.
-function isActiveInBayNow(booking) {
-  const now     = DateTime.now().setZone(TZ);
-  const todayStr = now.toISODate();
-  if (booking.date !== todayStr) return false;
-  if (booking.status !== "confirmed") return false;
-  if (booking.capacityType === "none") return false;
-
-  const slot24 = display12To24(booking.time);
-  if (!slot24) return false;
-
-  const startMins = toMinutes(slot24);
-  const endMins   = startMins + (booking.duration || 10);
-  const nowMins   = now.hour * 60 + now.minute;
-
-  return nowMins >= startMins && nowMins < endMins;
-}
-
 module.exports = {
   TZ,
-  NORMAL_BAYS,
-  ALIGN_LANES,
-  SLOT_INTERVAL,
   HOURS,
+  RESOURCE_POOLS,
   SERVICE_DEFS,
   ALL_SERVICES,
+  SLOT_INTERVAL,
   CAPACITY_BLOCKING_STATUSES,
   resolveService,
+  effectiveOccupation,
+  poolCapacity,
   getHoursForDate,
   toMinutes,
   fromMinutes,
   display12To24,
   display24To12,
   generateSlots,
-  countOverlapping,
-  maxCapacity,
+  occupancyDuring,
   computeAvailability,
   validateCapacity,
-  isActiveInBayNow,
 };
