@@ -1,5 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// models/Booking.js  v7
+// models/Booking.js  v7.3
+// Adds: deleted (soft delete), deletedAt
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
@@ -21,20 +22,15 @@ const bookingSchema = new mongoose.Schema(
     },
     customService: { type: String, trim: true, maxlength: 300, default: "" },
 
-    // ── Scheduling fields (denormalised from config at booking creation) ───────
-    // Stored so capacity queries work even if config changes later.
+    // ── Scheduling ───────────────────────────────────────────────────────────
     date:                    { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
-    time:                    { type: String, required: true }, // "9:00 AM"
-    service_duration:        { type: Number, required: true, default: 10 },  // minutes
-    equipment_recovery_time: { type: Number, default: 0 },    // minutes
-    resourcePool:            { type: String, enum: ["bay","alignment","none"], default: "none" },
+    time:                    { type: String, required: true },
+    service_duration:        { type: Number, required: true, default: 10 },
+    equipment_recovery_time: { type: Number, default: 0 },
+    resourcePool:            { type: String, enum: ["bay", "alignment", "none"], default: "none" },
 
-    // ── Capacity fields ───────────────────────────────────────────────────────
-    // customer_quantity: how many capacity units this booking consumes.
-    // Default = 1. Hidden from customer UI. Future-safe for multi-car bookings.
-    customer_quantity: { type: Number, default: 1, min: 1 },
-
-    // Per-slot capacity override (null = use pool default)
+    // ── Capacity ──────────────────────────────────────────────────────────────
+    customer_quantity:       { type: Number, default: 1, min: 1 },
     capacityOverrideApplied: { type: Number, default: null },
 
     // ── Tire info ─────────────────────────────────────────────────────────────
@@ -44,15 +40,15 @@ const bookingSchema = new mongoose.Schema(
     // ── Status ────────────────────────────────────────────────────────────────
     status: {
       type:    String,
-      enum:    ["pending","confirmed","waitlist","completed","cancelled"],
+      enum:    ["pending", "confirmed", "waitlist", "completed", "cancelled"],
       default: "pending",
     },
 
     // ── Notes ─────────────────────────────────────────────────────────────────
     notes: { type: String, trim: true, maxlength: 1000, default: "" },
 
-    // ── Bay assignment (Live at Bay) ───────────────────────────────────────────
-    bayNumber:           { type: Number, default: null },  // 1, 2, 3 for normal bays
+    // ── Bay assignment ────────────────────────────────────────────────────────
+    bayNumber:           { type: Number, default: null },
     activeInBayAt:       { type: Date,   default: null },
     bayCheckSnoozeUntil: { type: Date,   default: null },
 
@@ -60,14 +56,22 @@ const bookingSchema = new mongoose.Schema(
     smsSentAt: { type: Date, default: null },
     completedSmsVariant: {
       type:    String,
-      enum:    ["with_review","without_review","none",null],
+      enum:    ["with_review", "without_review", "none", null],
       default: null,
     },
 
     // ── Reminder tracking ─────────────────────────────────────────────────────
     reminderSentAt: { type: Date, default: null },
-    reminderStatus: { type: String, enum: ["sent","failed","skipped",null], default: null },
+    reminderStatus: { type: String, enum: ["sent", "failed", "skipped", null], default: null },
     reminderError:  { type: String, default: null },
+
+    // ── Soft delete ───────────────────────────────────────────────────────────
+    // deleted = true means the booking was "trashed" by admin.
+    // It is NOT permanently removed — it stays for 15 days then auto-purged.
+    // All capacity checks, live queue, live-at-bay, and availability
+    // MUST filter deleted: { $ne: true } to ignore these records.
+    deleted:   { type: Boolean, default: false },
+    deletedAt: { type: Date,    default: null },
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
     completedAt: { type: Date,    default: null },
@@ -77,13 +81,12 @@ const bookingSchema = new mongoose.Schema(
 );
 
 // ── Indexes ───────────────────────────────────────────────────────────────────
-// IMPORTANT: the old unique({ date, time }) index must be dropped.
-// Run: db.bookings.dropIndex("date_1_time_1")
-bookingSchema.index({ date: 1, time: 1 });                                  // non-unique
-bookingSchema.index({ date: 1, status: 1, resourcePool: 1 });               // capacity queries
-bookingSchema.index({ phone: 1 });                                          // customer history
-bookingSchema.index({ reminderStatus: 1, date: 1 });                        // reminder scheduler
-bookingSchema.index({ date: 1, status: 1, bayNumber: 1 });                  // live-at-bay
+bookingSchema.index({ date: 1, time: 1 });
+bookingSchema.index({ date: 1, status: 1, resourcePool: 1, deleted: 1 }); // capacity queries
+bookingSchema.index({ phone: 1 });
+bookingSchema.index({ reminderStatus: 1, date: 1 });
+bookingSchema.index({ date: 1, status: 1, bayNumber: 1 });
+bookingSchema.index({ deleted: 1, deletedAt: 1 });  // recently-deleted + cleanup queries
 
 bookingSchema.virtual("customer").get(function () {
   return `${this.firstName} ${this.lastName}`;

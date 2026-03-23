@@ -1,5 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// routes/bookings.js  v7.2
+// routes/bookings.js  v7.3
+//
+// Changes:
+//   - Soft delete: DELETE endpoint marks deleted=true/deletedAt instead of removing
+//   - PATCH /api/bookings/:id/restore — restore a soft-deleted booking
+//   - GET  /api/recently-deleted      — bookings deleted in last 15 days
+//   - deleted: { $ne: true } on EVERY query that should ignore trashed bookings
+//   - capacity checks import CAPACITY_BLOCKING_STATUS (string "confirmed")
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
@@ -12,12 +19,14 @@ const adminAuth = require("../middleware/adminAuth");
 const { handleValidation } = require("../middleware/validate");
 const {
   ALL_SERVICES, SERVICE_DEFS, HOURS, RESOURCE_POOLS,
-  resolveService, resolvedDuration, resolvedOccupation, effectiveOccupation,
+  CAPACITY_BLOCKING_STATUS,
+  resolveService, resolvedOccupation,
   computeAvailability, validateCapacity, getHoursForDate,
   display12To24, toMinutes,
 } = require("../config/business");
 
-const GOOGLE_REVIEW = "https://g.page/r/CYPKn0GrR0t3EBM/review";
+const GOOGLE_REVIEW     = "https://g.page/r/CYPKn0GrR0t3EBM/review";
+const SOFT_DELETE_DAYS  = 15; // auto-purge after 15 days
 
 // ── Twilio ────────────────────────────────────────────────────────────────────
 async function sendTwilioSMS(to, body) {
@@ -46,7 +55,6 @@ const sms = {
     `Hi ${b.firstName}! A spot just opened at Roadstar Tire on ${b.date}. Call us to claim it! — Roadstar Tire`,
   reminder: (b) =>
     `Hi ${b.firstName}, reminder: your Roadstar Tire appointment is TODAY at ${b.time} for ${svcLabel(b)}. See you soon! — Roadstar Tire`,
-  // Review link at the very bottom, required sentence before it
   completed_review: (b) =>
     `Thanks for visiting Roadstar Tire, ${b.firstName}! We hope you love your ${svcLabel(b)}. Drive safe!\n\nClick the link to leave us a review\n${GOOGLE_REVIEW}`,
   completed_no_review: (b) =>
@@ -65,10 +73,10 @@ router.get("/business-hours", (_req, res) => {
 });
 
 // ── GET /api/availability ─────────────────────────────────────────────────────
-// Returns { available, full, allSlots } so UI can show full slots grayed out.
-// available  = times that can still be booked
-// full       = times at capacity (grayed out, not hidden)
-// allSlots   = all future times for the day in order (available + full combined)
+// Returns { available, full, allSlots }
+// available = bookable slots
+// full      = at-capacity slots (show grayed out, not hidden)
+// allSlots  = time-ordered union
 router.get(
   "/availability",
   [
@@ -88,7 +96,7 @@ router.get(
   }
 );
 
-// ── POST /api/book ────────────────────────────────────────────────────────────
+// ── POST /api/book — public ───────────────────────────────────────────────────
 router.post(
   "/book",
   [
@@ -110,11 +118,17 @@ router.post(
   handleValidation,
   async (req, res) => {
     try {
-      const { firstName, lastName, phone, service, customService, date, time, tireSize, doesntKnowTireSize } = req.body;
+      const {
+        firstName, lastName, phone,
+        service, customService,
+        date, time,
+        tireSize, doesntKnowTireSize,
+      } = req.body;
 
       const def = resolveService(service);
 
-      // Server-side capacity validation — prevents race-condition double-booking
+      // validateCapacity only checks CONFIRMED, non-deleted bookings in the exact pool.
+      // "none" pool (Tire Purchase, Other) returns ok:true immediately.
       const cap = await validateCapacity(date, time, service, Booking, null);
       if (!cap.ok) {
         return res.status(409).json({ success: false, message: cap.reason });
@@ -131,17 +145,23 @@ router.post(
         customer_quantity:       1,
         tireSize:                tireSize || "",
         doesntKnowTireSize:      doesntKnowTireSize === true || doesntKnowTireSize === "true",
-        status: "pending",
+        status:                  "pending",
+        deleted:                 false,
       });
 
       if (req.io) {
         req.io.emit("new_booking", {
-          id: booking._id, customer: booking.customer,
-          service: booking.service, customService: booking.customService,
-          date: booking.date, time: booking.time,
-          phone: booking.phone, status: booking.status,
-          resourcePool: booking.resourcePool,
-          tireSize: booking.tireSize, doesntKnowTireSize: booking.doesntKnowTireSize,
+          id:                booking._id,
+          customer:          booking.customer,
+          service:           booking.service,
+          customService:     booking.customService,
+          date:              booking.date,
+          time:              booking.time,
+          phone:             booking.phone,
+          status:            booking.status,
+          resourcePool:      booking.resourcePool,
+          tireSize:          booking.tireSize,
+          doesntKnowTireSize:booking.doesntKnowTireSize,
         });
       }
 
@@ -149,35 +169,41 @@ router.post(
         success: true,
         message: "Booking created successfully.",
         booking: {
-          id: booking._id, customer: booking.customer,
-          service: booking.service, date: booking.date,
-          time: booking.time, status: booking.status,
+          id:       booking._id,
+          customer: booking.customer,
+          service:  booking.service,
+          date:     booking.date,
+          time:     booking.time,
+          status:   booking.status,
         },
       });
     } catch (err) {
       console.error("POST /api/book:", err);
-      // E11000 = old unique index still exists in MongoDB — treat as capacity conflict
       if (err.code === 11000) {
         return res.status(409).json({
           success: false,
           message: "That time is no longer available. Please choose another time.",
         });
       }
-      res.status(500).json({ success: false, message: "Something went wrong. Please try again or call us directly." });
+      res.status(500).json({
+        success: false,
+        message: "Something went wrong. Please try again or call us directly.",
+      });
     }
   }
 );
 
 // ── GET /api/bookings — admin ─────────────────────────────────────────────────
+// Never returns soft-deleted bookings (use /api/recently-deleted for those)
 router.get("/bookings", adminAuth, async (req, res) => {
   try {
-    const filter = {};
+    const filter = { deleted: { $ne: true } }; // exclude soft-deleted
     if (req.query.status) filter.status = req.query.status;
     if (req.query.date)   filter.date   = req.query.date;
+
     const bookings = await Booking.find(filter).sort({ date: 1, time: 1 });
 
-    // Enrich bookings where service_duration was saved as schema default (10)
-    // for services that are not actually 10 minutes.
+    // Enrich old records where service_duration was saved as schema default (10)
     const enriched = bookings.map(b => {
       const obj = b.toJSON();
       const def = resolveService(b.service);
@@ -201,11 +227,27 @@ router.get("/bookings", adminAuth, async (req, res) => {
   }
 });
 
+// ── GET /api/recently-deleted — admin ────────────────────────────────────────
+// Returns soft-deleted bookings from the last 15 days, newest first.
+router.get("/recently-deleted", adminAuth, async (req, res) => {
+  try {
+    const cutoff = new Date(Date.now() - SOFT_DELETE_DAYS * 24 * 60 * 60 * 1000);
+    const bookings = await Booking.find({
+      deleted:   true,
+      deletedAt: { $gte: cutoff },
+    }).sort({ deletedAt: -1 }).lean();
+
+    res.json({ success: true, count: bookings.length, bookings });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ── GET /api/customers — admin ────────────────────────────────────────────────
 router.get("/customers", adminAuth, async (req, res) => {
   try {
     const { search } = req.query;
-    const query = {};
+    const query = { deleted: { $ne: true } }; // exclude soft-deleted
     if (search) {
       const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       query.$or = [{ firstName: re }, { lastName: re }, { phone: re }];
@@ -214,10 +256,12 @@ router.get("/customers", adminAuth, async (req, res) => {
     const map = {};
     for (const b of bookings) {
       const key = b.phone;
-      if (!map[key]) map[key] = {
-        phone: b.phone, firstName: b.firstName, lastName: b.lastName,
-        visitCount: 0, bookings: [], tireSizes: new Set(), services: new Set(), lastVisit: b.date,
-      };
+      if (!map[key]) {
+        map[key] = {
+          phone: b.phone, firstName: b.firstName, lastName: b.lastName,
+          visitCount: 0, bookings: [], tireSizes: new Set(), services: new Set(), lastVisit: b.date,
+        };
+      }
       const c = map[key];
       c.visitCount++;
       c.bookings.push(b);
@@ -236,8 +280,6 @@ router.get("/customers", adminAuth, async (req, res) => {
 });
 
 // ── GET /api/live-bay — admin ─────────────────────────────────────────────────
-// Uses resolvedOccupation() so correct service durations are used even for
-// old records that have service_duration=10 (schema default).
 router.get("/live-bay", adminAuth, async (req, res) => {
   try {
     const { DateTime } = require("luxon");
@@ -246,10 +288,10 @@ router.get("/live-bay", adminAuth, async (req, res) => {
     const todayStr = now.toISODate();
     const nowMins  = now.hour * 60 + now.minute;
 
-    // Get all confirmed bookings for today (includes both bay and alignment)
     const todayConfirmed = await Booking.find({
-      date:   todayStr,
-      status: "confirmed",
+      date:    todayStr,
+      status:  "confirmed",
+      deleted: { $ne: true }, // exclude soft-deleted
     }).sort({ time: 1 }).lean();
 
     const active   = [];
@@ -257,44 +299,27 @@ router.get("/live-bay", adminAuth, async (req, res) => {
 
     for (const b of todayConfirmed) {
       if (b.resourcePool === "none") continue;
-
       const s24 = display12To24(b.time);
       if (!s24) continue;
-
       const startM = toMinutes(s24);
-      // Use resolvedOccupation — uses config duration as authoritative source
       const occ    = resolvedOccupation(b);
       const endM   = startM + occ;
 
       if (nowMins >= startM && nowMins < endM) {
-        active.push({
-          ...b,
-          minutesRemaining: endM - nowMins,
-          // Expose the correct duration for display
-          _resolvedDuration: occ,
-        });
+        active.push({ ...b, minutesRemaining: endM - nowMins, _resolvedDuration: occ });
       } else if (startM > nowMins) {
         upcoming.push(b);
       }
     }
 
-    // Assign bay numbers to normal bay bookings chronologically.
-    // Alignment bookings get their own dedicated lane label.
     let normalBayCounter = 1;
     const activeBays = active.map(b => {
-      if (b.resourcePool === "alignment") {
-        return { ...b, assignedBay: "alignment" };
-      }
+      if (b.resourcePool === "alignment") return { ...b, assignedBay: "alignment" };
       const bn = b.bayNumber || normalBayCounter++;
       return { ...b, assignedBay: bn };
     });
 
-    res.json({
-      success:  true,
-      active:   activeBays,
-      upcoming: upcoming.slice(0, 6),
-      now:      now.toISO(),
-    });
+    res.json({ success: true, active: activeBays, upcoming: upcoming.slice(0, 6), now: now.toISO() });
   } catch (err) {
     console.error("GET /api/live-bay:", err);
     res.status(500).json({ success: false, message: "Server error" });
@@ -307,8 +332,8 @@ router.patch("/bookings/:id/bay-snooze", adminAuth, async (req, res) => {
     const { DateTime } = require("luxon");
     const { TZ } = require("../config/business");
     const snoozeUntil = DateTime.now().setZone(TZ).plus({ minutes: 10 }).toJSDate();
-    const updated = await Booking.findByIdAndUpdate(
-      req.params.id,
+    const updated = await Booking.findOneAndUpdate(
+      { _id: req.params.id, deleted: { $ne: true } },
       { $set: { bayCheckSnoozeUntil: snoozeUntil } },
       { new: true }
     );
@@ -345,7 +370,7 @@ router.patch(
       } = req.body;
 
       if (time || date) {
-        const current = await Booking.findById(id);
+        const current = await Booking.findOne({ _id: id, deleted: { $ne: true } });
         if (!current) return res.status(404).json({ success: false, message: "Booking not found." });
         const newDate = date || current.date;
         const newTime = time || current.time;
@@ -364,17 +389,21 @@ router.patch(
       if (bayNumber !== undefined) updates.bayNumber = bayNumber;
       if (status === "completed") updates.completedAt = new Date();
 
-      const updated = await Booking.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
+      const updated = await Booking.findOneAndUpdate(
+        { _id: id, deleted: { $ne: true } },
+        { $set: updates },
+        { new: true, runValidators: true }
+      );
       if (!updated) return res.status(404).json({ success: false, message: "Booking not found." });
 
-      // Auto-SMS on status change
+      // Auto-SMS
       let smsSent = false;
       if (status && triggerSMS !== false) {
         let msg = null;
         if (status === "confirmed") msg = sms.confirmed(updated);
         if (status === "cancelled") msg = sms.declined(updated);
         if (status === "completed") {
-          if (completedSmsVariant === "with_review")    msg = sms.completed_review(updated);
+          if (completedSmsVariant === "with_review")         msg = sms.completed_review(updated);
           else if (completedSmsVariant === "without_review") msg = sms.completed_no_review(updated);
         }
         if (msg) {
@@ -398,7 +427,9 @@ router.patch(
   }
 );
 
-// ── DELETE /api/bookings/:id ──────────────────────────────────────────────────
+// ── DELETE /api/bookings/:id — soft delete ────────────────────────────────────
+// Does NOT permanently remove. Sets deleted=true and deletedAt=now.
+// Booking moves to Recently Deleted section and auto-purges after 15 days.
 router.delete(
   "/bookings/:id",
   adminAuth,
@@ -406,10 +437,38 @@ router.delete(
   handleValidation,
   async (req, res) => {
     try {
-      const deleted = await Booking.findByIdAndDelete(req.params.id);
-      if (!deleted) return res.status(404).json({ success: false, message: "Not found" });
+      const updated = await Booking.findOneAndUpdate(
+        { _id: req.params.id, deleted: { $ne: true } },
+        { $set: { deleted: true, deletedAt: new Date() } },
+        { new: true }
+      );
+      if (!updated) return res.status(404).json({ success: false, message: "Not found" });
+
       if (req.io) req.io.emit("booking_deleted", { id: req.params.id });
-      res.json({ success: true, message: "Booking deleted" });
+      res.json({ success: true, message: "Booking moved to Recently Deleted." });
+    } catch (err) {
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  }
+);
+
+// ── PATCH /api/bookings/:id/restore — restore from trash ─────────────────────
+router.patch(
+  "/bookings/:id/restore",
+  adminAuth,
+  [param("id").isMongoId()],
+  handleValidation,
+  async (req, res) => {
+    try {
+      const updated = await Booking.findOneAndUpdate(
+        { _id: req.params.id, deleted: true },
+        { $set: { deleted: false, deletedAt: null } },
+        { new: true }
+      );
+      if (!updated) return res.status(404).json({ success: false, message: "Not found or not deleted." });
+
+      if (req.io) req.io.emit("booking_restored", { id: req.params.id, booking: updated });
+      res.json({ success: true, message: "Booking restored.", booking: updated });
     } catch (err) {
       res.status(500).json({ success: false, message: "Server error" });
     }
@@ -427,7 +486,7 @@ router.post(
   handleValidation,
   async (req, res) => {
     try {
-      const booking = await Booking.findById(req.params.id);
+      const booking = await Booking.findOne({ _id: req.params.id, deleted: { $ne: true } });
       if (!booking) return res.status(404).json({ success: false, message: "Not found" });
       if (!process.env.TWILIO_ACCOUNT_SID)
         return res.status(503).json({ success: false, message: "Twilio not configured." });
@@ -450,7 +509,7 @@ router.get("/queue", async (req, res) => {
     if (!date || !bookingId)
       return res.status(400).json({ success: false, message: "date and bookingId required" });
     const active = await Booking.find(
-      { date, status: { $in: ["pending","confirmed","waitlist"] } },
+      { date, status: { $in: ["pending","confirmed","waitlist"] }, deleted: { $ne: true } },
       { time: 1, _id: 1 }
     ).sort({ time: 1 });
     const idx = active.findIndex(b => b._id.toString() === bookingId);
@@ -464,4 +523,22 @@ router.get("/queue", async (req, res) => {
   }
 });
 
+// ── Cleanup: permanently purge bookings deleted > 15 days ago ─────────────────
+async function purgeOldDeletedBookings() {
+  try {
+    const cutoff = new Date(Date.now() - SOFT_DELETE_DAYS * 24 * 60 * 60 * 1000);
+    const result = await Booking.deleteMany({
+      deleted:   true,
+      deletedAt: { $lt: cutoff },
+    });
+    if (result.deletedCount > 0) {
+      console.log(`[Cleanup] Purged ${result.deletedCount} bookings deleted > ${SOFT_DELETE_DAYS} days ago`);
+    }
+  } catch (err) {
+    console.error("[Cleanup] Error:", err.message);
+  }
+}
+
+// Export cleanup so index.js can call it on startup + schedule it
 module.exports = router;
+module.exports.purgeOldDeletedBookings = purgeOldDeletedBookings;
