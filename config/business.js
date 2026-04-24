@@ -1,11 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// config/business.js  v8
-// All capacity functions accept optional shopConfig (from buildShopConfig).
-// Falls back to hardcoded defaults when shopConfig is null.
+// config/business.js  v9-supabase
+// Same capacity logic as before — only the DB queries changed.
+// computeAvailability and validateCapacity now use db.Bookings helpers.
 // ─────────────────────────────────────────────────────────────────────────────
 "use strict";
 
 const { DateTime } = require("luxon");
+const { Bookings } = require("../lib/db");
 
 const DEFAULT_TZ = "America/Toronto";
 
@@ -39,8 +40,6 @@ const SLOT_INTERVAL            = 15;
 const CAPACITY_BLOCKING_STATUS = "confirmed";
 
 // ── buildShopConfig ────────────────────────────────────────────────────────────
-// Converts a ShopSettings mongoose document into the config object
-// that all business logic functions expect.
 function buildShopConfig(settings) {
   if (!settings) return null;
 
@@ -68,30 +67,27 @@ function buildShopConfig(settings) {
   };
 
   return {
-    tz:           settings.timezone || DEFAULT_TZ,
+    tz:              settings.timezone          || DEFAULT_TZ,
     hours,
     serviceDefs,
     allServices,
     resourcePools,
-    blackoutDates: settings.blackoutDates || [],
-    shopName:      settings.shopName || "Shop",
-    googleReviewLink: settings.googleReviewLink || "",
-    smsTemplates:  settings.smsTemplates || {},
-    reminderEnabled: settings.reminderEnabled !== false,
-    reminderMinutes: settings.reminderMinutes || 30,
+    blackoutDates:   settings.blackoutDates     || [],
+    shopName:        settings.shopName          || "Shop",
+    googleReviewLink:settings.googleReviewLink  || "",
+    smsTemplates:    settings.smsTemplates      || {},
+    reminderEnabled: settings.reminderEnabled   !== false,
+    reminderMinutes: settings.reminderMinutes   || 30,
   };
 }
 
-// ── SMS template renderer ──────────────────────────────────────────────────────
-// Replaces {firstName}, {shopName}, {date}, {time}, {service}, {reviewLink}
 function renderSmsTemplate(template, vars) {
   return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? "");
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 function getHoursForDate(dateStr, shopConfig) {
   const hoursMap = shopConfig?.hours ?? DEFAULT_HOURS;
-  const tz       = shopConfig?.tz ?? DEFAULT_TZ;
+  const tz       = shopConfig?.tz    ?? DEFAULT_TZ;
   const dt  = DateTime.fromISO(dateStr, { zone: tz });
   const dow = dt.weekday === 7 ? 0 : dt.weekday;
   return hoursMap[dow] ?? null;
@@ -110,15 +106,15 @@ function poolCapacity(resourcePool, shopConfig, slotOverride) {
 
 function resolvedDuration(b, shopConfig) {
   const def    = resolveService(b.service || "", shopConfig);
-  const stored = b.service_duration;
+  const stored = b.serviceDuration; // camelCase from toCamel()
   if (stored && stored > 10) return stored;
   return def.service_duration;
 }
 
 function resolvedOccupation(b, shopConfig) {
   const def = resolveService(b.service || "", shopConfig);
-  const rec = (b.equipment_recovery_time !== undefined && b.equipment_recovery_time !== null)
-    ? b.equipment_recovery_time : def.equipment_recovery_time;
+  const rec = (b.equipmentRecoveryTime !== undefined && b.equipmentRecoveryTime !== null)
+    ? b.equipmentRecoveryTime : def.equipment_recovery_time;
   return resolvedDuration(b, shopConfig) + rec;
 }
 
@@ -140,17 +136,17 @@ function display12To24(str) {
   if (/^\d{2}:\d{2}$/.test(str)) return str;
   const m = str.match(/^(\d+):(\d{2})\s*(AM|PM)$/i);
   if (!m) return null;
-  let h = parseInt(m[1],10);
-  const mn = parseInt(m[2],10);
-  if (m[3].toUpperCase()==="PM" && h!==12) h+=12;
-  if (m[3].toUpperCase()==="AM" && h===12) h=0;
+  let h = parseInt(m[1], 10);
+  const mn = parseInt(m[2], 10);
+  if (m[3].toUpperCase() === "PM" && h !== 12) h += 12;
+  if (m[3].toUpperCase() === "AM" && h === 12) h = 0;
   return `${String(h).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
 }
 
 function display24To12(hhmm) {
-  const [h,m] = hhmm.split(":").map(Number);
-  const p   = h>=12?"PM":"AM";
-  const h12 = h===0?12:h>12?h-12:h;
+  const [h, m] = hhmm.split(":").map(Number);
+  const p   = h >= 12 ? "PM" : "AM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
   return `${h12}:${String(m).padStart(2,"0")} ${p}`;
 }
 
@@ -163,7 +159,7 @@ function generateSlots(dateStr, serviceName, shopConfig) {
   const closeM = toMinutes(hours.close);
   const last   = closeM - occMin;
   const slots  = [];
-  for (let t=openM; t<=last; t+=SLOT_INTERVAL) slots.push(display24To12(fromMinutes(t)));
+  for (let t = openM; t <= last; t += SLOT_INTERVAL) slots.push(display24To12(fromMinutes(t)));
   return slots;
 }
 
@@ -172,25 +168,26 @@ function occupancyDuring(bookings, newStart24, newOccupation, resourcePool, shop
   const ne = ns + newOccupation;
   let total = 0;
   for (const b of bookings) {
+    // b is camelCase from toCamel() in db.js
     if (b.resourcePool !== resourcePool) continue;
     const bs24 = display12To24(b.time) || b.time;
     if (!bs24) continue;
     const bs  = toMinutes(bs24);
     const occ = resolvedOccupation(b, shopConfig);
     const be  = bs + occ;
-    if (ns < be && ne > bs) total += (b.customer_quantity || 1);
+    if (ns < be && ne > bs) total += (b.customerQuantity || 1);
   }
   return total;
 }
 
 // ── computeAvailability ────────────────────────────────────────────────────────
-async function computeAvailability(dateStr, serviceName, Booking, shopId, shopConfig) {
+// Uses Bookings.findConfirmedForCapacity() instead of Mongoose
+async function computeAvailability(dateStr, serviceName, shopId, shopConfig) {
   const def          = resolveService(serviceName, shopConfig);
   const occ          = effectiveOccupation(def);
   const { resourcePool } = def;
   const tz           = shopConfig?.tz ?? DEFAULT_TZ;
 
-  // Blackout date → fully closed
   if ((shopConfig?.blackoutDates ?? []).includes(dateStr)) {
     return { available:[], full:[], allSlots:[], businessHours:null, def, resourcePool, occupation:occ, blackout:true };
   }
@@ -202,7 +199,6 @@ async function computeAvailability(dateStr, serviceName, Booking, shopId, shopCo
 
   const candidates = generateSlots(dateStr, serviceName, shopConfig);
 
-  // No-bay services: always available (no capacity check)
   if (resourcePool === "none") {
     const now     = DateTime.now().setZone(tz);
     const isToday = dateStr === now.toISODate();
@@ -214,10 +210,8 @@ async function computeAvailability(dateStr, serviceName, Booking, shopId, shopCo
     return { available:allSlots, full:[], allSlots, businessHours:hours, def, resourcePool, occupation:occ };
   }
 
-  const existing = await Booking.find(
-    { shopId, date:dateStr, status:CAPACITY_BLOCKING_STATUS, resourcePool, deleted:{$ne:true} },
-    { time:1, service:1, service_duration:1, equipment_recovery_time:1, resourcePool:1, customer_quantity:1, _id:0 }
-  ).lean();
+  // Supabase query — returns camelCase rows
+  const existing = await Bookings.findConfirmedForCapacity(shopId, dateStr, resourcePool);
 
   const now     = DateTime.now().setZone(tz);
   const isToday = dateStr === now.toISODate();
@@ -244,7 +238,7 @@ async function computeAvailability(dateStr, serviceName, Booking, shopId, shopCo
 }
 
 // ── validateCapacity ───────────────────────────────────────────────────────────
-async function validateCapacity(dateStr, slot, serviceName, Booking, shopId, excludeId, shopConfig) {
+async function validateCapacity(dateStr, slot, serviceName, shopId, excludeId, shopConfig) {
   const def          = resolveService(serviceName, shopConfig);
   const occ          = effectiveOccupation(def);
   const { resourcePool } = def;
@@ -253,17 +247,12 @@ async function validateCapacity(dateStr, slot, serviceName, Booking, shopId, exc
   const slot24 = display12To24(slot) || slot;
   const cap    = poolCapacity(resourcePool, shopConfig);
 
-  const q = { shopId, date:dateStr, status:CAPACITY_BLOCKING_STATUS, resourcePool, deleted:{$ne:true} };
-  if (excludeId) q._id = { $ne: excludeId };
-
-  const existing = await Booking.find(
-    q,
-    { time:1, service:1, service_duration:1, equipment_recovery_time:1, resourcePool:1, customer_quantity:1, _id:0 }
-  ).lean();
+  let existing = await Bookings.findConfirmedForCapacity(shopId, dateStr, resourcePool);
+  if (excludeId) existing = existing.filter(b => b.id !== excludeId);
 
   const used = occupancyDuring(existing, slot24, occ, resourcePool, shopConfig);
   if (used >= cap) {
-    const noun = resourcePool==="alignment" ? "alignment lane" : "service bay";
+    const noun = resourcePool === "alignment" ? "alignment lane" : "service bay";
     return { ok:false, reason:`That time is no longer available — the ${noun} is fully booked. Please choose another time.` };
   }
   return { ok:true };
