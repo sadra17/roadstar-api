@@ -1,62 +1,39 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// models/AuditLog.js
-//
-// Immutable audit trail. Documents are never updated or deleted.
-//
-// Entity types: booking | customer | setting | user | service | hours |
-//               blackout | capacity | sms_template | price | login
-//
-// Action types: created | updated | deleted | restored | status_changed |
-//               confirmed | cancelled | completed | no_show | sms_sent |
-//               login_success | login_failed | password_changed | role_changed |
-//               shop_created | shop_paused | shop_activated
-// ─────────────────────────────────────────────────────────────────────────────
+// routes/auditLog.js  v9-supabase
 "use strict";
 
-const mongoose = require("mongoose");
+const express = require("express");
+const router  = express.Router();
 
-const auditLogSchema = new mongoose.Schema(
-  {
-    // ── Context ───────────────────────────────────────────────────────────────
-    shopId: { type: String, required: true },
+const { AuditLogs } = require("../lib/db");
+const adminAuth     = require("../middleware/adminAuth");
+const { requirePermission } = require("../middleware/adminAuth");
 
-    // ── Actor ─────────────────────────────────────────────────────────────────
-    userId:    { type: String, default: null }, // null for system events
-    userEmail: { type: String, default: null },
-    userName:  { type: String, default: null },
-    userRole:  { type: String, default: null },
+router.get("/audit-log", adminAuth, requirePermission("view:audit_log"), async (req, res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page  || "1", 10));
+    const limit = Math.min(200, parseInt(req.query.limit || "50", 10));
 
-    // ── Event ─────────────────────────────────────────────────────────────────
-    action:     { type: String, required: true }, // e.g. "updated", "status_changed"
-    entity:     { type: String, required: true }, // e.g. "booking", "setting"
-    entityId:   { type: String, default: null  }, // MongoDB _id of affected document
-    entityLabel:{ type: String, default: null  }, // human label, e.g. "John Smith — 9:00 AM"
+    const filter = {};
+    if (!req.user._isSuperAdmin) filter.shop_id = req.shopId;
+    else if (req.query.shopId)   filter.shop_id = req.query.shopId;
 
-    // ── Change detail ─────────────────────────────────────────────────────────
-    field:      { type: String, default: null }, // which field changed, e.g. "status"
-    before:     { type: mongoose.Schema.Types.Mixed, default: null }, // previous value
-    after:      { type: mongoose.Schema.Types.Mixed, default: null }, // new value
-    meta:       { type: mongoose.Schema.Types.Mixed, default: null }, // extra context
+    if (req.query.entity)   filter.entity   = req.query.entity;
+    if (req.query.action)   filter.action   = req.query.action;
+    if (req.query.userId)   filter.user_id  = req.query.userId;
+    if (req.query.entityId) filter.entity_id= req.query.entityId;
 
-    // ── Request context ───────────────────────────────────────────────────────
-    ip:        { type: String, default: null },
-    userAgent: { type: String, default: null },
-  },
-  {
-    timestamps: true,
-    // Audit logs are never updated
-    // Use createdAt as the event timestamp
+    if (req.query.from || req.query.to) {
+      filter.created_at = {};
+      if (req.query.from) filter.created_at.$gte = new Date(req.query.from).toISOString();
+      if (req.query.to)   filter.created_at.$lte = new Date(req.query.to).toISOString();
+    }
+
+    const { logs, total } = await AuditLogs.find(filter, page, limit);
+    res.json({ success: true, page, limit, total, pages: Math.ceil(total / limit), logs });
+  } catch (err) {
+    console.error("GET /api/audit-log:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
-);
+});
 
-// Compound indexes for dashboard filter queries
-auditLogSchema.index({ shopId: 1, createdAt: -1 });
-auditLogSchema.index({ shopId: 1, entity: 1, createdAt: -1 });
-auditLogSchema.index({ shopId: 1, userId: 1, createdAt: -1 });
-auditLogSchema.index({ shopId: 1, entityId: 1, createdAt: -1 });
-
-// TTL: optionally auto-delete old audit logs after 365 days
-// Uncomment to enable:
-// auditLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 365 * 24 * 60 * 60 });
-
-module.exports = mongoose.model("AuditLog", auditLogSchema);
+module.exports = router;
