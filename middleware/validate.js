@@ -5,7 +5,7 @@ const handleValidation = (req, res, next) => {
   if (!errors.isEmpty()) {
     return res.status(422).json({
       success: false,
-      errors: errors.array().map((e) => ({ field: e.path, message: e.msg })),
+      errors: errors.array().map(e => ({ field: e.path, message: e.msg })),
     });
   }
   next();
