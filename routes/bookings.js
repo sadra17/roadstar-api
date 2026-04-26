@@ -385,7 +385,9 @@ router.patch("/bookings/:id/payment", adminAuth, requirePermission("manage:price
       if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
       const { quotedPrice, finalPrice, paymentMethod, paymentStatus, paymentNotes } = req.body;
       const before = { quotedPrice:booking.quotedPrice, finalPrice:booking.finalPrice, paymentMethod:booking.paymentMethod, paymentStatus:booking.paymentStatus };
-      const updates = { priceAddedBy:req.userId||null, priceAddedAt:new Date().toISOString() };
+      // Only pass userId if it's a real UUID (not 'env-admin' or 'system')
+      const isRealUUID = req.userId && req.userId !== 'env-admin' && req.userId !== 'system' && req.userId.includes('-');
+      const updates = { priceAddedBy:isRealUUID?req.userId:null, priceAddedAt:new Date().toISOString() };
       if (quotedPrice!==undefined) updates.quotedPrice=quotedPrice;
       if (finalPrice!==undefined)  updates.finalPrice=finalPrice;
       if (paymentMethod!==undefined) updates.paymentMethod=paymentMethod;
