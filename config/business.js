@@ -52,10 +52,11 @@ function buildShopConfig(settings) {
   const serviceDefs = {};
   const allServices = [];
   (settings.services || []).filter(s => s.active !== false).forEach(s => {
+    // Support both camelCase (from toCamel) and snake_case (legacy)
     serviceDefs[s.name] = {
-      service_duration:        s.service_duration,
-      equipment_recovery_time: s.equipment_recovery_time || 0,
-      resourcePool:            s.resourcePool || "none",
+      service_duration:        s.serviceDuration        ?? s.service_duration        ?? 30,
+      equipment_recovery_time: s.equipmentRecoveryTime  ?? s.equipment_recovery_time ?? 0,
+      resourcePool:            s.resourcePool           ?? s.resource_pool           ?? "none",
     };
     allServices.push(s.name);
   });
