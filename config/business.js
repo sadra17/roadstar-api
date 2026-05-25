@@ -77,8 +77,10 @@ function buildShopConfig(settings) {
     shopName:        settings.shopName          || "Shop",
     googleReviewLink:settings.googleReviewLink  || "",
     smsTemplates:    settings.smsTemplates      || {},
-    reminderEnabled: settings.reminderEnabled   !== false,
-    reminderMinutes: settings.reminderMinutes   || 30,
+    reminderEnabled:        settings.reminderEnabled        !== false,
+    reminderMinutes:        settings.reminderMinutes        || 30,
+    reminderAdvanceEnabled: settings.reminderAdvanceEnabled === true,
+    reminderAdvanceHours:   settings.reminderAdvanceHours   || 24,
   };
 }
 

@@ -21,7 +21,7 @@ const FIELD_GROUPS = {
   capacity:     ["bayCount","alignmentLaneEnabled","alignmentCapacity"],
   sms:          ["smsTemplates"],
   review:       ["googleReviewLink"],
-  reminders:    ["reminderEnabled","reminderMinutes"],
+  reminders:    ["reminderEnabled","reminderMinutes","reminderAdvanceEnabled","reminderAdvanceHours"],
   branding:     ["logoUrl","primaryColor"],
   email:        ["collectEmailEnabled","emailConsentText"],
 };
