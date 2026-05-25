@@ -17,15 +17,33 @@ function roleSessionExpiry(role, customHours) {
   return role === "mechanic" ? "24h" : "8h";
 }
 
+// ── S3: x-admin-secret is a legacy bypass — warn on startup if it is set ──────
+if (process.env.ADMIN_SECRET) {
+  if (process.env.NODE_ENV === "production") {
+    console.warn(
+      "[Security] ADMIN_SECRET is set in production. This header bypasses JWT auth entirely. " +
+      "Remove it from Render env vars once all internal callers use JWT."
+    );
+  }
+}
+
 const adminAuth = async (req, res, next) => {
   const legacyKey  = req.headers["x-admin-secret"];
   const authHeader = req.headers["authorization"];
 
-  if (legacyKey && legacyKey === process.env.ADMIN_SECRET) {
-    req.user = { userId:"system", email:"system@internal", name:"System", role:"superadmin", shopId: req.headers["x-shop-id"] || process.env.DEFAULT_SHOP_ID || "roadstar", can:()=>true, _isSuperAdmin:true };
-    req.shopId = req.user.shopId;
-    req.userId = "system";
-    return next();
+  // S3: Block the legacy secret bypass in production unless explicitly allowed.
+  // Set ALLOW_ADMIN_SECRET=true in env vars only if internal tooling requires it.
+  if (legacyKey && process.env.ADMIN_SECRET) {
+    if (process.env.NODE_ENV === "production" && process.env.ALLOW_ADMIN_SECRET !== "true") {
+      console.warn(`[Security] x-admin-secret used in production from ${req.ip} — blocked. Set ALLOW_ADMIN_SECRET=true to re-enable.`);
+      return res.status(401).json({ success: false, message: "No token provided" });
+    }
+    if (legacyKey === process.env.ADMIN_SECRET) {
+      req.user = { userId:"system", email:"system@internal", name:"System", role:"superadmin", shopId: req.headers["x-shop-id"] || process.env.DEFAULT_SHOP_ID || "roadstar", can:()=>true, _isSuperAdmin:true };
+      req.shopId = req.user.shopId;
+      req.userId = "system";
+      return next();
+    }
   }
 
   if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ success:false, message:"No token provided" });

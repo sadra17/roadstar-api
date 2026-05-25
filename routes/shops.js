@@ -55,17 +55,23 @@ router.post("/admin/shops", ...superOnly,
 
       const passwordHash = await bcrypt.hash(ownerPassword, 10);
 
-      // Create shop
+      // EH7: create shop first, then roll back on any subsequent failure
       const shop = await Shops.create({ shopId, name, email: ownerEmail.toLowerCase(), passwordHash, active: true, plan: plan || "trial" });
 
-      // Create default settings
-      await ShopSettings.getOrCreate(shopId);
-      // Update shop name in settings
-      await ShopSettings.update(shopId, { shop_name: name });
+      let owner;
+      try {
+        // Create default settings
+        await ShopSettings.getOrCreate(shopId);
+        await ShopSettings.update(shopId, { shop_name: name });
 
-      // Create owner user
-      const ownerHash = await bcrypt.hash(ownerPassword, 10);
-      const owner = await Users.create({ shopId, name: ownerName, email: ownerEmail.toLowerCase(), passwordHash: ownerHash, role: "owner" });
+        // Create owner user (same password as shop login for convenience)
+        owner = await Users.create({ shopId, name: ownerName, email: ownerEmail.toLowerCase(), passwordHash, role: "owner" });
+      } catch (innerErr) {
+        // Rollback: clean up the shop row so the shopId is not orphaned
+        console.error(`[Shops] Rolling back shop "${shopId}" after inner error:`, innerErr.message);
+        try { await Shops.delete(shopId); } catch (rbErr) { console.error("[Shops] Rollback failed:", rbErr.message); }
+        throw innerErr; // re-throw so the outer catch returns 500
+      }
 
       await createAuditLog(
         { shopId: "superadmin", user: req.user, ip: req.ip },
@@ -78,8 +84,8 @@ router.post("/admin/shops", ...superOnly,
         shop: { shopId, name, plan: shop.plan },
         owner: { email: owner.email, name: owner.name, role: owner.role },
         embedInstructions: {
-          availabilityUrl: `https://roadstar-api.onrender.com/api/availability?shopId=${shopId}`,
-          businessHoursUrl: `https://roadstar-api.onrender.com/api/business-hours?shopId=${shopId}`,
+          availabilityUrl: `${process.env.API_URL || "https://roadstar-api.onrender.com"}/api/availability?shopId=${shopId}`,
+          businessHoursUrl: `${process.env.API_URL || "https://roadstar-api.onrender.com"}/api/business-hours?shopId=${shopId}`,
           shopIdParam: shopId,
         },
       });

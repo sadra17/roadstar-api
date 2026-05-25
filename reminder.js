@@ -27,15 +27,15 @@ async function runReminderCheck() {
     const winStart  = nowMins+minutesBefore-1;
     const winEnd    = nowMins+minutesBefore+1;
 
-    const candidates = await Bookings.find({
+    // P3: status filter pushed to DB — avoids loading cancelled/no_show/completed rows
+    const eligible = await Bookings.find({
       shop_id:         shopId,
       date:            todayStr,
+      status:          { $in: ["pending","confirmed","waitlist"] },
       reminder_status: null,
       reminder_sent_at:null,
       deleted:         false,
     });
-    // Filter to pending/confirmed/waitlist
-    const eligible = candidates.filter(b => ["pending","confirmed","waitlist"].includes(b.status));
 
     for (const b of eligible) {
       try {

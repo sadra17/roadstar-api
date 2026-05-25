@@ -240,6 +240,16 @@ async function computeAvailability(dateStr, serviceName, shopId, shopConfig) {
 
 // ── validateCapacity ───────────────────────────────────────────────────────────
 async function validateCapacity(dateStr, slot, serviceName, shopId, excludeId, shopConfig) {
+  // C5 fix: blackout check was only in computeAvailability — direct API calls bypassed it
+  if ((shopConfig?.blackoutDates ?? []).includes(dateStr)) {
+    return { ok: false, reason: "This date is not available for bookings." };
+  }
+
+  // Also reject closed days
+  if (!getHoursForDate(dateStr, shopConfig)) {
+    return { ok: false, reason: "The shop is closed on this day." };
+  }
+
   const def          = resolveService(serviceName, shopConfig);
   const occ          = effectiveOccupation(def);
   const { resourcePool } = def;

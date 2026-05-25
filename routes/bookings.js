@@ -16,10 +16,34 @@ const {
   DEFAULT_SERVICE_DEFS, DEFAULT_RESOURCE_POOLS,
   resolveService, resolvedOccupation,
   computeAvailability, validateCapacity, getHoursForDate,
-  display12To24, toMinutes,
+  display12To24, toMinutes, generateSlots,
 } = require("../config/business");
 
 const SOFT_DELETE_DAYS = 15;
+
+// ── Per-slot booking mutex ────────────────────────────────────────────────────
+// Prevents race condition where two simultaneous POST /api/book requests
+// both pass validateCapacity() before either inserts. Lock key is
+// shopId|date|resourcePool so unrelated slots never block each other.
+// This is safe on Render's single-process deployment. A Redis lock would be
+// needed for multi-process deployments.
+const _slotLocks = new Map();
+
+async function withSlotLock(key, fn) {
+  // Queue behind any existing lock on this exact slot
+  while (_slotLocks.has(key)) {
+    await _slotLocks.get(key);
+  }
+  let resolve;
+  const p = new Promise(r => { resolve = r; });
+  _slotLocks.set(key, p);
+  try {
+    return await fn();
+  } finally {
+    _slotLocks.delete(key);
+    resolve();
+  }
+}
 
 async function loadConfig(shopId) {
   const settings = await getOrCreate(shopId);
@@ -37,6 +61,9 @@ function buildSmsBody(messageType, booking, shopConfig) {
   const reviewLink = shopConfig?.googleReviewLink || "";
   const svcLabel   = booking.service === "Other" && booking.customService ? `Other — ${booking.customService}` : booking.service;
   const templates  = shopConfig?.smsTemplates || {};
+  // toCamel() converts stored JSONB keys: no_show→noShow, completed_review→completedReview, etc.
+  // Try both the original snake_case key AND the camelCase version to handle both DB states.
+  const camelType = messageType.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
   const defaults = {
     confirmed:           "Hi {firstName}! Your {shopName} appointment is CONFIRMED for {date} at {time} ({service}). See you soon! — {shopName}",
     declined:            "Hi {firstName}, we had to cancel your {time} appointment on {date}. Please call us to reschedule. — {shopName}",
@@ -46,7 +73,8 @@ function buildSmsBody(messageType, booking, shopConfig) {
     completed_no_review: "Thanks for visiting {shopName}, {firstName}! We hope you love your {service}. Drive safe! — {shopName}",
     no_show:             "Hi {firstName}, we missed you today at {shopName} for your {service} appointment. Please call us to reschedule. — {shopName}",
   };
-  const template = templates[messageType] || defaults[messageType] || "";
+  // Lookup: try snake_case first, then camelCase (after toCamel DB round-trip), then default
+  const template = templates[messageType] || templates[camelType] || defaults[messageType] || "";
   if (!template) return null;
   return renderSmsTemplate(template, { firstName: booking.firstName, shopName, date: booking.date, time: booking.time, service: svcLabel, reviewLink });
 }
@@ -122,7 +150,7 @@ router.post("/book",
     body("firstName").trim().notEmpty().isLength({ max:60 }).escape(),
     body("lastName").trim().notEmpty().isLength({ max:60 }).escape(),
     body("phone").trim().notEmpty().matches(/^[\d\s\-\(\)\+]{7,20}$/),
-    body("email").optional().trim().isEmail().normalizeEmail(),
+    body("email").optional({ checkFalsy: true }).trim().isEmail().normalizeEmail(),
     body("service").trim().notEmpty(),
     body("customService").optional().trim().isLength({ max:300 }).escape(),
     body("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/),
@@ -142,26 +170,51 @@ router.post("/book",
       if (!getHoursForDate(date, config)) {
         return res.status(400).json({ success: false, message: "The shop is closed on this day." });
       }
-      const def = resolveService(service, config);
-      const cap = await validateCapacity(date, time, service, shopId, null, config);
-      if (!cap.ok) return res.status(409).json({ success: false, message: cap.reason });
 
-      const booking = await Bookings.create({
-        shopId, firstName, lastName, phone,
-        email:         email || "",
-        service,
-        customService: customService || "",
-        date, time,
-        serviceDuration:       def.service_duration,
-        equipmentRecoveryTime: def.equipment_recovery_time,
-        resourcePool:          def.resourcePool,
-        customerQuantity:      1,
-        tireSize:         tireSize || "",
-        doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
-        emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
-        status:  "pending",
-        deleted: false,
+      // API8: validate service is in the shop's active service list
+      const activeServices = config?.allServices || Object.keys(DEFAULT_SERVICE_DEFS);
+      if (!activeServices.includes(service)) {
+        return res.status(400).json({ success: false, message: "That service is not currently offered by this shop." });
+      }
+
+      // API7: validate that the requested time slot actually exists for this date+service
+      // (prevents booking into slots outside business hours or non-15-min-boundary times)
+      const validSlots = generateSlots(date, service, config);
+      const slot24 = display12To24(time) || time;
+      const isValidSlot = validSlots.some(s => (display12To24(s) || s) === slot24);
+      if (!isValidSlot) {
+        return res.status(400).json({ success: false, message: "That time slot is not available for this service on this date." });
+      }
+
+      const def = resolveService(service, config);
+
+      // Lock key: shopId|date|resourcePool — only serialize bookings that compete
+      // for the same resource pool on the same date. Unrelated slots run in parallel.
+      const lockKey = `${shopId}|${date}|${def.resourcePool}`;
+      const result = await withSlotLock(lockKey, async () => {
+        const cap = await validateCapacity(date, time, service, shopId, null, config);
+        if (!cap.ok) return { conflict: true, reason: cap.reason };
+        const bk = await Bookings.create({
+          shopId, firstName, lastName, phone,
+          email:         email || "",
+          service,
+          customService: customService || "",
+          date, time,
+          serviceDuration:       def.service_duration,
+          equipmentRecoveryTime: def.equipment_recovery_time,
+          resourcePool:          def.resourcePool,
+          customerQuantity:      1,
+          tireSize:         tireSize || "",
+          doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
+          emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
+          status:  "pending",
+          deleted: false,
+        });
+        return { booking: bk };
       });
+
+      if (result.conflict) return res.status(409).json({ success: false, message: result.reason });
+      const booking = result.booking;
 
       if (req.io) req.io.to(`shop:${shopId}`).emit("new_booking", {
         id: booking.id, customer: `${booking.firstName} ${booking.lastName}`,
@@ -187,17 +240,19 @@ router.get("/bookings", adminAuth, requirePermission("view:bookings"), async (re
 
     const bookings = await Bookings.find(filter, { orderBy: { col: "date", asc: true } });
 
-    // Fetch sms_log for each booking (batch would be better at scale, fine for now)
-    const enriched = await Promise.all(bookings.map(async b => {
+    // P2: single batch query for all SMS logs instead of N per-booking queries
+    const smsLogMap = await SmsLog.findByBookingBatch(bookings.map(b => b.id));
+
+    const enriched = bookings.map(b => {
       const def = resolveService(b.service, config);
       if (!b.serviceDuration || (b.serviceDuration === 10 && b.service !== "Tire Purchase") || !b.resourcePool) {
         b.serviceDuration       = def.service_duration;
         b.equipmentRecoveryTime = b.equipmentRecoveryTime ?? def.equipment_recovery_time;
         b.resourcePool          = def.resourcePool;
       }
-      b.smsLog = await SmsLog.findByBooking(b.id);
+      b.smsLog = smsLogMap[b.id] || [];
       return b;
-    }));
+    });
 
     res.json({ success: true, count: enriched.length, bookings: enriched });
   } catch (err) {
@@ -223,17 +278,19 @@ router.get("/customers", adminAuth, requirePermission("view:customers"), async (
   try {
     const { search } = req.query;
     const filter = { shop_id: req.shopId, deleted: false };
-    const bookings = await Bookings.find(filter, { orderBy: { col: "created_at", asc: false } });
 
-    // Filter by search client-side (Supabase ilike for server-side search at scale)
-    let filtered = bookings;
+    // BE7: use Supabase ilike for server-side search instead of loading all rows into memory.
+    // Searches first_name, last_name, phone, email independently (OR). Combined full-name
+    // search (e.g. "John Smith") is not supported at DB level but covers the common cases.
+    const findOpts = { orderBy: { col: "created_at", asc: false } };
     if (search) {
-      const q = search.toLowerCase();
-      filtered = bookings.filter(b =>
-        `${b.firstName} ${b.lastName}`.toLowerCase().includes(q) ||
-        b.phone.includes(q) || (b.email || "").toLowerCase().includes(q)
-      );
+      findOpts.orSearch = [
+        ["first_name", search], ["last_name", search],
+        ["phone", search], ["email", search],
+      ];
     }
+    const bookings = await Bookings.find(filter, findOpts);
+    const filtered = bookings;
 
     const map = {};
     for (const b of filtered) {
@@ -424,12 +481,18 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
       const current = await Bookings.findById(id);
       if (!current||current.shopId!==req.shopId) return res.status(404).json({success:false,message:"Booking not found."});
 
+      // CQ5: load config once — reused for reschedule capacity check AND SMS sending below
+      const { config } = await loadConfig(req.shopId);
+
       if (time||date) {
-        const { config } = await loadConfig(req.shopId);
         const newDate = date ? (typeof date==="object"?date.toISOString().slice(0,10):date) : current.date;
         const newTime = time || current.time;
-        const cap = await validateCapacity(newDate, newTime, current.service, req.shopId, id, config);
-        if (!cap.ok) return res.status(409).json({success:false,message:cap.reason});
+        const def     = resolveService(current.service, config);
+        const lockKey = `${req.shopId}|${newDate}|${def.resourcePool}`;
+        const capResult = await withSlotLock(lockKey, () =>
+          validateCapacity(newDate, newTime, current.service, req.shopId, id, config)
+        );
+        if (!capResult.ok) return res.status(409).json({success:false,message:capResult.reason});
       }
 
       const updates = {};
@@ -459,10 +522,9 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
         });
       }
 
-      // SMS
+      // SMS — uses config loaded above (CQ5: no second loadConfig call)
       let smsSent=false;
       if (status&&triggerSMS!==false) {
-        const { config } = await loadConfig(req.shopId);
         let mt=null;
         if (status==="confirmed") mt="confirmed";
         if (status==="cancelled") mt="declined";
@@ -530,7 +592,9 @@ router.get("/queue", async (req, res) => {
     const active = await Bookings.find({ shop_id:shopId, date, status:{$in:["pending","confirmed","waitlist"]}, deleted:false }, { orderBy:{col:"time",asc:true} });
     const idx = active.findIndex(b=>b.id===bookingId);
     if (idx===-1) return res.json({success:true,position:0,waitMinutes:0,message:"You are next!"});
-    res.json({ success:true, position:idx, waitMinutes:idx*40, totalInQueue:active.length, message:idx===0?"You are next!":`${idx} customer${idx>1?"s":""} ahead` });
+    // UX3: sum actual service durations of bookings ahead instead of hardcoded 40min
+    const waitMinutes = active.slice(0, idx).reduce((sum, b) => sum + (b.serviceDuration || 40), 0);
+    res.json({ success:true, position:idx, waitMinutes, totalInQueue:active.length, message:idx===0?"You are next!":`${idx} customer${idx>1?"s":""} ahead` });
   } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
 });
 
