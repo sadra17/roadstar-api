@@ -8,8 +8,8 @@ const ROLES = ["superadmin","owner","frontdesk","mechanic"];
 const ROLE_PERMISSIONS = {
   superadmin: ["view:all_shops","manage:shops","switch:shop","view:bookings","manage:bookings","view:customers","manage:customers","export:customers","view:analytics","view:revenue","view:settings","manage:settings","view:users","manage:users","view:audit_log","view:live_bay","manage:live_bay","view:mechanic","manage:mechanic","manage:prices"],
   owner:      ["view:bookings","manage:bookings","view:customers","manage:customers","export:customers","view:analytics","view:revenue","view:settings","manage:settings","view:users","manage:users","view:audit_log","view:live_bay","manage:live_bay","view:mechanic","manage:mechanic","manage:prices"],
-  frontdesk:  ["view:bookings","manage:bookings","view:customers","manage:customers","view:live_bay","manage:prices"],
-  mechanic:   ["view:live_bay","manage:live_bay","view:mechanic","manage:mechanic"],
+  frontdesk:  ["view:bookings","manage:bookings","view:customers","manage:customers","view:live_bay","manage:live_bay","manage:prices"],
+  mechanic:   ["view:bookings","manage:bookings","view:live_bay","manage:live_bay","view:mechanic","manage:mechanic"],
 };
 
 function roleSessionExpiry(role, customHours) {

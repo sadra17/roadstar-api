@@ -37,16 +37,8 @@ router.post("/users", adminAuth, requirePermission("manage:users"),
     try {
       const { name, email, password, role } = req.body;
       const shopId = req.user._isSuperAdmin && req.body.shopId ? req.body.shopId : req.shopId;
-      // Check globally — users.email has a UNIQUE constraint across all shops + deleted rows.
-      // Scoping to shop_id + deleted:false lets soft-deleted emails slip past, then the INSERT
-      // crashes with a unique-constraint violation (500). Check the entire table instead.
       const existing = await Users.findOne({ email: email.toLowerCase() });
-      if (existing) {
-        const msg = existing.deleted
-          ? "This email belongs to a deleted account. Use a different email or ask an admin to restore the old account."
-          : "A user with this email already exists.";
-        return res.status(409).json({ success: false, message: msg });
-      }
+      if (existing) return res.status(409).json({ success: false, message: "A user with this email already exists." });
       const passwordHash = await bcrypt.hash(password, 10);
       const user = await Users.create({ shopId, name, email: email.toLowerCase(), passwordHash, role });
       await createAuditLog(req, { action:"created", entity:"user", entityId:user.id, entityLabel:`${name} (${role})`, after:{ name, email, role, shopId } });
@@ -88,9 +80,9 @@ router.delete("/users/:id", adminAuth, requirePermission("manage:users"),
       const target = await Users.findById(req.params.id);
       if (!target) return res.status(404).json({ success: false, message: "User not found" });
       if (!req.user._isSuperAdmin && target.shopId !== req.shopId) return res.status(403).json({ success: false, message: "Access denied" });
-      await Users.update(req.params.id, { deleted: true, active: false });
+      await Users.hardDelete(req.params.id);
       await createAuditLog(req, { action:"deleted", entity:"user", entityId:req.params.id, entityLabel:`${target.name} (${target.role})` });
-      res.json({ success: true, message: "User deactivated" });
+      res.json({ success: true, message: "User deleted" });
     } catch (err) {
       res.status(500).json({ success: false, message: "Server error" });
     }

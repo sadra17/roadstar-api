@@ -120,11 +120,20 @@ router.patch("/admin/shops/:shopId", ...superOnly,
 router.get("/admin/shops/:shopId/stats", ...superOnly, async (req, res) => {
   try {
     const { shopId } = req.params;
-    const [bookingCount, userCount] = await Promise.all([
-      Bookings.countDocuments({ shop_id: shopId, deleted: false }),
-      (async () => { const u = await Users.find({ shop_id: shopId, deleted: false }); return u.length; })(),
+    const now     = new Date();
+    const today   = now.toISOString().slice(0, 10);
+    const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const [todayBookings, weekBookings, allBookings] = await Promise.all([
+      Bookings.countDocuments({ shop_id: shopId, date: today,                          deleted: false }),
+      Bookings.countDocuments({ shop_id: shopId, date: { $gte: weekAgo, $lte: today }, deleted: false }),
+      Bookings.find(          { shop_id: shopId,                                        deleted: false }, { select: "phone" }),
     ]);
-    res.json({ success: true, shopId, bookingCount, userCount });
+
+    // Unique customers by phone number
+    const totalCustomers = new Set(allBookings.map(b => b.phone).filter(Boolean)).size;
+
+    res.json({ success: true, shopId, todayBookings, weekBookings, totalCustomers });
   } catch (err) {
     res.status(500).json({ success: false, message: "Server error" });
   }
