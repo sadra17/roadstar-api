@@ -80,7 +80,7 @@ router.delete("/users/:id", adminAuth, requirePermission("manage:users"),
       const target = await Users.findById(req.params.id);
       if (!target) return res.status(404).json({ success: false, message: "User not found" });
       if (!req.user._isSuperAdmin && target.shopId !== req.shopId) return res.status(403).json({ success: false, message: "Access denied" });
-      await Users.update(req.params.id, { deleted: true, deleted_at: new Date().toISOString(), active: false });
+      await Users.update(req.params.id, { deleted: true, active: false });
       await createAuditLog(req, { action:"deleted", entity:"user", entityId:req.params.id, entityLabel:`${target.name} (${target.role})` });
       res.json({ success: true, message: "User deactivated" });
     } catch (err) {
