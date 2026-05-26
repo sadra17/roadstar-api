@@ -31,11 +31,12 @@ const adminAuth = async (req, res, next) => {
   const legacyKey  = req.headers["x-admin-secret"];
   const authHeader = req.headers["authorization"];
 
-  // S3: Block the legacy secret bypass in production unless explicitly allowed.
-  // Set ALLOW_ADMIN_SECRET=true in env vars only if internal tooling requires it.
-  if (legacyKey && process.env.ADMIN_SECRET) {
+  // S3: Legacy secret bypass — only honoured when no Bearer token is present.
+  // If a Bearer token exists, skip entirely and let JWT verification handle it
+  // (avoids blocking old clients that send both headers simultaneously).
+  if (legacyKey && process.env.ADMIN_SECRET && !authHeader?.startsWith("Bearer ")) {
     if (process.env.NODE_ENV === "production" && process.env.ALLOW_ADMIN_SECRET !== "true") {
-      console.warn(`[Security] x-admin-secret used in production from ${req.ip} — blocked. Set ALLOW_ADMIN_SECRET=true to re-enable.`);
+      console.warn(`[Security] x-admin-secret used in production from ${req.ip} — blocked. Remove ADMIN_SECRET env var or set ALLOW_ADMIN_SECRET=true.`);
       return res.status(401).json({ success: false, message: "No token provided" });
     }
     if (legacyKey === process.env.ADMIN_SECRET) {
