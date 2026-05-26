@@ -37,8 +37,16 @@ router.post("/users", adminAuth, requirePermission("manage:users"),
     try {
       const { name, email, password, role } = req.body;
       const shopId = req.user._isSuperAdmin && req.body.shopId ? req.body.shopId : req.shopId;
-      const existing = await Users.findOne({ email: email.toLowerCase(), shop_id: shopId, deleted: false });
-      if (existing) return res.status(409).json({ success: false, message: "A user with this email already exists" });
+      // Check globally — users.email has a UNIQUE constraint across all shops + deleted rows.
+      // Scoping to shop_id + deleted:false lets soft-deleted emails slip past, then the INSERT
+      // crashes with a unique-constraint violation (500). Check the entire table instead.
+      const existing = await Users.findOne({ email: email.toLowerCase() });
+      if (existing) {
+        const msg = existing.deleted
+          ? "This email belongs to a deleted account. Use a different email or ask an admin to restore the old account."
+          : "A user with this email already exists.";
+        return res.status(409).json({ success: false, message: msg });
+      }
       const passwordHash = await bcrypt.hash(password, 10);
       const user = await Users.create({ shopId, name, email: email.toLowerCase(), passwordHash, role });
       await createAuditLog(req, { action:"created", entity:"user", entityId:user.id, entityLabel:`${name} (${role})`, after:{ name, email, role, shopId } });
