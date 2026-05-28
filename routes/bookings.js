@@ -174,7 +174,8 @@ router.post("/book",
       }
 
       // API8: validate service is in the shop's active service list
-      const activeServices = config?.allServices || Object.keys(DEFAULT_SERVICE_DEFS);
+      // NOTE: use .length check — an empty array [] is truthy, so `|| fallback` would never fire
+      const activeServices = config?.allServices?.length ? config.allServices : Object.keys(DEFAULT_SERVICE_DEFS);
       if (!activeServices.includes(service)) {
         return res.status(400).json({ success: false, message: "That service is not currently offered by this shop." });
       }
