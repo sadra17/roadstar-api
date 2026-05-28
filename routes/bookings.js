@@ -176,7 +176,6 @@ router.post("/book",
       // API8: validate service is in the shop's active service list
       // NOTE: use .length check — an empty array [] is truthy, so `|| fallback` would never fire
       const activeServices = config?.allServices?.length ? config.allServices : Object.keys(DEFAULT_SERVICE_DEFS);
-      console.log(`[POST /api/book] shopId="${shopId}" service="${service}" activeServices=${JSON.stringify(activeServices)}`);
       if (!activeServices.includes(service)) {
         return res.status(400).json({ success: false, message: "That service is not currently offered by this shop." });
       }
@@ -386,7 +385,10 @@ router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (re
     const todayStr     = now.toISODate();
     const nowMins      = now.hour*60+now.minute;
 
+    // Active bay items: confirmed bookings whose time window is now
+    // Upcoming: all non-cancelled/completed bookings later today (pending + confirmed + waitlist)
     const todayConfirmed = await Bookings.find({ shop_id: req.shopId, date: todayStr, status: "confirmed", deleted: false }, { orderBy: { col: "time", asc: true } });
+    const todayAll       = await Bookings.find({ shop_id: req.shopId, date: todayStr, deleted: false },                      { orderBy: { col: "time", asc: true } });
 
     const active=[], upcoming=[];
     for (const b of todayConfirmed) {
@@ -398,7 +400,14 @@ router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (re
       const totalOcc = occ + (b.bayTimeExtendedBy||0);
       const endM   = startM + totalOcc;
       if (nowMins>=startM&&nowMins<endM) active.push({...b,minutesRemaining:endM-nowMins,_resolvedDuration:totalOcc,_extendedBy:b.bayTimeExtendedBy||0});
-      else if (startM>nowMins) upcoming.push(b);
+    }
+    const activeIds = new Set(active.map(b => b.id));
+    for (const b of todayAll) {
+      if (["cancelled","completed"].includes(b.status)) continue;
+      if (activeIds.has(b.id)) continue;
+      const s24 = display12To24(b.time);
+      if (!s24) continue;
+      if (toMinutes(s24) > nowMins) upcoming.push(b);
     }
     let counter=1;
     const activeBays=active.map(b=>b.resourcePool==="alignment"?{...b,assignedBay:"alignment"}:{...b,assignedBay:b.bayNumber||counter++});
