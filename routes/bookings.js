@@ -19,6 +19,8 @@ const {
   display12To24, toMinutes, generateSlots,
 } = require("../config/business");
 
+const jwt = require("jsonwebtoken");
+
 const SOFT_DELETE_DAYS = 15;
 
 // ── Per-slot booking mutex ────────────────────────────────────────────────────
@@ -188,6 +190,20 @@ router.post("/book",
 
       const def = resolveService(service, config);
 
+      // Staff walk-ins: if a valid staff JWT is present, allow status override (confirmed/pending)
+      // Public Shopify form bookings always create as "pending" (no token present)
+      let bookingStatus = "pending";
+      const authHeader = req.headers["authorization"];
+      if (authHeader?.startsWith("Bearer ")) {
+        try {
+          const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
+          if (["superadmin","owner","frontdesk"].includes(decoded.role) &&
+              ["pending","confirmed"].includes(req.body.status)) {
+            bookingStatus = req.body.status;
+          }
+        } catch {} // invalid/expired token — default to pending
+      }
+
       // Lock key: shopId|date|resourcePool — only serialize bookings that compete
       // for the same resource pool on the same date. Unrelated slots run in parallel.
       const lockKey = `${shopId}|${date}|${def.resourcePool}`;
@@ -207,7 +223,7 @@ router.post("/book",
           tireSize:         tireSize || "",
           doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
           emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
-          status:  "pending",
+          status:  bookingStatus,
           deleted: false,
         });
         return { booking: bk };
