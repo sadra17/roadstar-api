@@ -52,13 +52,18 @@ function buildShopConfig(settings) {
   const serviceDefs = {};
   const allServices = [];
   (settings.services || []).filter(s => s.active !== false).forEach(s => {
+    // Normalize the name — stray leading/trailing spaces in saved service names
+    // would otherwise never match the trimmed name the booking form submits,
+    // causing "That service is not currently offered by this shop."
+    const name = (s.name || "").trim();
+    if (!name) return;
     // Support both camelCase (from toCamel) and snake_case (legacy)
-    serviceDefs[s.name] = {
+    serviceDefs[name] = {
       service_duration:        s.serviceDuration        ?? s.service_duration        ?? 30,
       equipment_recovery_time: s.equipmentRecoveryTime  ?? s.equipment_recovery_time ?? 0,
       resourcePool:            s.resourcePool           ?? s.resource_pool           ?? "none",
     };
-    allServices.push(s.name);
+    allServices.push(name);
   });
 
   const resourcePools = {
