@@ -159,6 +159,7 @@ router.post("/book",
     body("time").trim().notEmpty(),
     body("tireSize").optional().trim().isLength({ max:50 }).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
+    body("tireQuantity").optional({ nullable: true, checkFalsy: true }).isInt({ min:1, max:50 }).toInt(),
     body("shopId").optional().trim(),
     body("emailConsent").optional().isBoolean(),
   ],
@@ -167,7 +168,7 @@ router.post("/book",
     try {
       const shopId = req.body.shopId || req.headers["x-shop-id"] || process.env.DEFAULT_SHOP_ID || "roadstar";
       const { config } = await loadConfig(shopId);
-      const { firstName, lastName, phone, email, service, customService, date, time, tireSize, doesntKnowTireSize } = req.body;
+      const { firstName, lastName, phone, email, service, customService, date, time, tireSize, doesntKnowTireSize, tireQuantity } = req.body;
 
       if (!getHoursForDate(date, config)) {
         return res.status(400).json({ success: false, message: "The shop is closed on this day." });
@@ -223,6 +224,7 @@ router.post("/book",
           customerQuantity:      1,
           tireSize:         tireSize || "",
           doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
+          tireQuantity:     Number.isInteger(tireQuantity) ? tireQuantity : null,
           emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
           status:  bookingStatus,
           deleted: false,
@@ -376,6 +378,11 @@ router.get("/customers/by-phone/:phone", adminAuth, requirePermission("view:cust
 });
 
 // ── GET /api/live-bay — admin/mechanic ───────────────────────────────────────
+// A car is "live at bay" ONLY after a mechanic presses Start (sets bay_started_at).
+// It leaves the bay when a mechanic presses End (sets bay_ended_at).
+//   active   = started, not yet ended (currently in a bay)
+//   ready    = confirmed today, needs a bay, not yet started (mechanic must accept/Start)
+//   upcoming = other non-cancelled/completed bookings later today (info only)
 router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (req, res) => {
   try {
     const { DateTime } = require("luxon");
@@ -384,35 +391,87 @@ router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (re
     const now          = DateTime.now().setZone(tz);
     const todayStr     = now.toISODate();
     const nowMins      = now.hour*60+now.minute;
+    const nowMs        = now.toMillis();
 
-    // Active bay items: confirmed bookings whose time window is now
-    // Upcoming: all non-cancelled/completed bookings later today (pending + confirmed + waitlist)
-    const todayConfirmed = await Bookings.find({ shop_id: req.shopId, date: todayStr, status: "confirmed", deleted: false }, { orderBy: { col: "time", asc: true } });
-    const todayAll       = await Bookings.find({ shop_id: req.shopId, date: todayStr, deleted: false },                      { orderBy: { col: "time", asc: true } });
+    const todayAll = await Bookings.find(
+      { shop_id: req.shopId, date: todayStr, deleted: false },
+      { orderBy: { col: "time", asc: true } }
+    );
 
-    const active=[], upcoming=[];
-    for (const b of todayConfirmed) {
-      if (b.resourcePool === "none") continue;
-      const s24 = display12To24(b.time);
-      if (!s24) continue;
-      const startM = toMinutes(s24);
-      const occ    = resolvedOccupation(b, config);
-      const totalOcc = occ + (b.bayTimeExtendedBy||0);
-      const endM   = startM + totalOcc;
-      if (nowMins>=startM&&nowMins<endM) active.push({...b,minutesRemaining:endM-nowMins,_resolvedDuration:totalOcc,_extendedBy:b.bayTimeExtendedBy||0});
-    }
-    const activeIds = new Set(active.map(b => b.id));
+    const active = [], ready = [], upcoming = [];
     for (const b of todayAll) {
       if (["cancelled","completed"].includes(b.status)) continue;
-      if (activeIds.has(b.id)) continue;
+
+      // Live in a bay: mechanic has started it and not yet ended it
+      if (b.bayStartedAt && !b.bayEndedAt) {
+        const occ      = resolvedOccupation(b, config);
+        const totalOcc = occ + (b.bayTimeExtendedBy||0);
+        const elapsed  = Math.max(0, Math.round((nowMs - DateTime.fromISO(b.bayStartedAt).toMillis()) / 60000));
+        active.push({
+          ...b,
+          _elapsedMinutes:   elapsed,
+          minutesRemaining:  totalOcc - elapsed,
+          _resolvedDuration: totalOcc,
+          _extendedBy:       b.bayTimeExtendedBy||0,
+        });
+        continue;
+      }
+      if (b.bayEndedAt) continue; // already finished its bay session
+
+      // Ready to start: confirmed, needs a bay, not started yet
+      if (b.status === "confirmed" && b.resourcePool !== "none") {
+        ready.push(b);
+        continue;
+      }
+
+      // Everything else still to come today (pending, waitlist, no-bay services)
       const s24 = display12To24(b.time);
-      if (!s24) continue;
-      if (toMinutes(s24) > nowMins) upcoming.push(b);
+      if (s24 && toMinutes(s24) >= nowMins) upcoming.push(b);
     }
-    let counter=1;
-    const activeBays=active.map(b=>b.resourcePool==="alignment"?{...b,assignedBay:"alignment"}:{...b,assignedBay:b.bayNumber||counter++});
-    res.json({ success:true, active:activeBays, upcoming:upcoming.slice(0,8), now:now.toISO() });
-  } catch (err) { res.status(500).json({ success:false, message:"Server error" }); }
+
+    let counter = 1;
+    const activeBays = active.map(b =>
+      b.resourcePool === "alignment"
+        ? { ...b, assignedBay: "alignment" }
+        : { ...b, assignedBay: b.bayNumber || counter++ }
+    );
+
+    res.json({ success:true, active:activeBays, ready, upcoming:upcoming.slice(0,8), now:now.toISO() });
+  } catch (err) { console.error("GET /api/live-bay:", err); res.status(500).json({ success:false, message:"Server error" }); }
+});
+
+// ── PATCH /api/bookings/:id/bay-start — mechanic accepts & puts car in bay ────
+router.patch("/bookings/:id/bay-start", adminAuth, requirePermission("manage:live_bay"), [param("id").isUUID()], handleValidation, async (req, res) => {
+  try {
+    const booking = await Bookings.findById(req.params.id);
+    if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+    if (booking.bayStartedAt && !booking.bayEndedAt) {
+      return res.json({ success:true, booking, message:"Already in a bay." });
+    }
+    const startedAt = new Date().toISOString();
+    // Starting also confirms the booking if it was still pending/waitlist
+    const updates = { bayStartedAt: startedAt, bayEndedAt: null, bayDurationMinutes: null };
+    if (["pending","waitlist"].includes(booking.status)) updates.status = "confirmed";
+    const updated = await Bookings.update(req.params.id, req.shopId, updates);
+    await createAuditLog(req, { action:"bay_start", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, meta:{ startedAt } });
+    if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_updated", { id:req.params.id, booking:updated });
+    res.json({ success:true, booking:updated, message:"Car is now live at bay." });
+  } catch (err) { console.error("bay-start:", err); res.status(500).json({ success:false, message:"Server error" }); }
+});
+
+// ── PATCH /api/bookings/:id/bay-end — mechanic ends job, returns time in shop ──
+router.patch("/bookings/:id/bay-end", adminAuth, requirePermission("manage:live_bay"), [param("id").isUUID()], handleValidation, async (req, res) => {
+  try {
+    const booking = await Bookings.findById(req.params.id);
+    if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+    if (!booking.bayStartedAt) return res.status(400).json({ success:false, message:"This car was never started." });
+    const endedAt    = new Date().toISOString();
+    const durationMinutes = Math.max(0, Math.round((new Date(endedAt) - new Date(booking.bayStartedAt)) / 60000));
+    const updated = await Bookings.update(req.params.id, req.shopId, { bayEndedAt: endedAt, bayDurationMinutes: durationMinutes });
+    await createAuditLog(req, { action:"bay_end", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, meta:{ durationMinutes } });
+    if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_updated", { id:req.params.id, booking:updated });
+    res.json({ success:true, booking:updated, durationMinutes, message:`In the shop for ${durationMinutes} min.` });
+  } catch (err) { console.error("bay-end:", err); res.status(500).json({ success:false, message:"Server error" }); }
 });
 
 // ── PATCH /api/bookings/:id/bay-snooze ───────────────────────────────────────
