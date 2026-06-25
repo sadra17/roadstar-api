@@ -194,16 +194,18 @@ router.post("/book",
 
       // Staff walk-ins: if a valid staff JWT is present, allow status override (confirmed/pending)
       // Public Shopify form bookings always create as "pending" (no token present)
+      // source: "walkin" when created by signed-in staff, "online" from the public form.
       let bookingStatus = "pending";
+      let bookingSource = "online";
       const authHeader = req.headers["authorization"];
       if (authHeader?.startsWith("Bearer ")) {
         try {
           const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
-          if (["superadmin","owner","frontdesk"].includes(decoded.role) &&
-              ["pending","confirmed"].includes(req.body.status)) {
-            bookingStatus = req.body.status;
+          if (["superadmin","owner","frontdesk","mechanic"].includes(decoded.role)) {
+            bookingSource = "walkin";
+            if (["pending","confirmed"].includes(req.body.status)) bookingStatus = req.body.status;
           }
-        } catch {} // invalid/expired token — default to pending
+        } catch {} // invalid/expired token — default to pending/online
       }
 
       // Lock key: shopId|date|resourcePool — only serialize bookings that compete
@@ -227,6 +229,7 @@ router.post("/book",
           tireQuantity:     Number.isInteger(tireQuantity) ? tireQuantity : null,
           emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
           status:  bookingStatus,
+          source:  bookingSource,
           deleted: false,
         });
         return { booking: bk };
@@ -557,12 +560,17 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
     body("completedSmsVariant").optional().isIn(["with_review","without_review","none"]),
     body("tireSize").optional().trim().isLength({max:50}).escape(),
     body("doesntKnowTireSize").optional().isBoolean(),
+    body("tireQuantity").optional({ nullable:true, checkFalsy:true }).isInt({min:1,max:50}).toInt(),
+    body("firstName").optional().trim().notEmpty().isLength({max:60}).escape(),
+    body("lastName").optional().trim().notEmpty().isLength({max:60}).escape(),
+    body("phone").optional().trim().matches(/^[\d\s\-\(\)\+]{7,20}$/),
+    body("email").optional({ checkFalsy:true }).trim().isEmail().normalizeEmail(),
     body("bayNumber").optional().isInt({min:1,max:3}),
   ], handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, notes, time, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, bayNumber } = req.body;
+      const { status, notes, time, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, tireQuantity, firstName, lastName, phone, email, bayNumber } = req.body;
 
       const current = await Bookings.findById(id);
       if (!current||current.shopId!==req.shopId) return res.status(404).json({success:false,message:"Booking not found."});
@@ -588,6 +596,11 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
       if (date!==undefined)   updates.date=(typeof date==="object"?date.toISOString().slice(0,10):date);
       if (tireSize!==undefined) updates.tireSize=tireSize;
       if (doesntKnowTireSize!==undefined) updates.doesntKnowTireSize=doesntKnowTireSize;
+      if (tireQuantity!==undefined) updates.tireQuantity = Number.isInteger(tireQuantity) ? tireQuantity : null;
+      if (firstName!==undefined) updates.firstName=firstName;
+      if (lastName!==undefined)  updates.lastName=lastName;
+      if (phone!==undefined)     updates.phone=phone;
+      if (email!==undefined)     updates.email=email;
       if (completedSmsVariant!==undefined) updates.completedSmsVariant=completedSmsVariant;
       if (bayNumber!==undefined) updates.bayNumber=bayNumber;
       if (status==="completed") updates.completedAt=new Date().toISOString();
