@@ -6,6 +6,7 @@ const { body, query, param } = require("express-validator");
 const router  = express.Router();
 
 const { Bookings, SmsLog, ShopSettings } = require("../lib/db");
+const { sendEmail } = require("../lib/email");
 const adminAuth = require("../middleware/adminAuth");
 const { requirePermission } = require("../middleware/adminAuth");
 const { handleValidation }  = require("../middleware/validate");
@@ -673,6 +674,140 @@ router.patch("/bookings/:id/restore", adminAuth, requirePermission("manage:booki
     res.json({ success:true, message:"Booking restored.", booking:updated });
   } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
 });
+
+// ── Wheel & Tire Inspection Report ────────────────────────────────────────────
+// The report is stored as a JSON document on the booking (inspection column).
+// Item ids are camelCase so they survive the db layer's snake/camel conversion.
+// This server-side map is the source of truth for the emailed report (prevents
+// the client from injecting arbitrary label HTML).
+const INSPECTION_SECTIONS = [
+  { title: "Wheel / Rim Condition", items: [
+    ["previousCosmeticRimDamage","Previous cosmetic rim damage"],
+    ["wheelBent","Wheel bent"],
+    ["wheelCracked","Wheel cracked"],
+    ["wheelCorrosion","Wheel corrosion"],
+    ["wheelPreviouslyRepaired","Wheel previously repaired"],
+    ["wheelSeizedToHub","Wheel seized to hub"],
+    ["centerBoreHubDamage","Center bore / hub damage"],
+    ["hubRingMissing","Hub ring missing"],
+    ["hubRingSeized","Hub ring seized"],
+  ]},
+  { title: "Lug Nuts / Bolts / Studs", items: [
+    ["rustedLugNutsBolts","Rusted lug nuts / bolts"],
+    ["swollenLugNuts","Swollen lug nuts"],
+    ["roundedDamagedLugNuts","Rounded / damaged lug nuts"],
+    ["previouslyOverTorqued","Previously over-torqued"],
+    ["previouslyUnderTorqued","Previously under-torqued"],
+    ["crossThreadedLugNutBolt","Cross-threaded lug nut / bolt"],
+    ["damagedThreads","Damaged threads"],
+    ["brokenWheelStud","Broken wheel stud"],
+    ["strippedWheelStud","Stripped wheel stud"],
+    ["studLengthInsufficient","Stud length insufficient"],
+    ["missingLugNutBolt","Missing lug nut / bolt"],
+    ["wheelLockDamagedMissingKey","Wheel lock damaged / missing key"],
+  ]},
+  { title: "Tires / Valves / TPMS", items: [
+    ["unevenTreadWear","Uneven tread wear"],
+    ["lowTreadDepth","Low tread depth"],
+    ["sidewallDamage","Sidewall damage"],
+    ["puncturePreviousRepair","Puncture / previous repair"],
+    ["dryRotCracking","Dry rot / cracking"],
+    ["incorrectTirePressure","Incorrect tire pressure"],
+    ["mismatchedTires","Mismatched tires"],
+    ["beadDamageObserved","Bead damage observed"],
+    ["valveStemCracked","Valve stem cracked"],
+    ["tpmsSensorDamaged","TPMS sensor damaged"],
+  ]},
+  { title: "Hub / Mounting Surface", items: [
+    ["heavyRustOnHubFace","Heavy rust on hub face"],
+    ["hubPreventsProperWheelSeating","Hub prevents proper wheel seating"],
+    ["rotorHatExcessiveCorrosion","Rotor hat excessive corrosion"],
+    ["mountingSurfaceRequiresCleaning","Mounting surface requires cleaning"],
+  ]},
+];
+const esc = s => String(s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+function buildInspectionEmail(booking, insp, shopName) {
+  const checked = new Set(Array.isArray(insp.checked) ? insp.checked : []);
+  const sectionsHtml = INSPECTION_SECTIONS.map(sec => {
+    const flagged = sec.items.filter(([id]) => checked.has(id));
+    if (!flagged.length) return "";
+    const lis = flagged.map(([,label]) => `<li style="margin:2px 0;color:#b91c1c">⚠ ${esc(label)}</li>`).join("");
+    return `<div style="margin:14px 0"><div style="font-weight:700;font-size:14px;color:#111">${esc(sec.title)}</div><ul style="margin:6px 0 0;padding-left:20px;font-size:13px">${lis}</ul></div>`;
+  }).join("");
+  const anyFlagged = [...checked].length > 0;
+  const field = (l,v) => v ? `<td style="padding:3px 14px 3px 0;font-size:13px"><b>${esc(l)}:</b> ${esc(v)}</td>` : "";
+  return `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#111">
+      <h2 style="margin:0 0 2px">${esc(shopName || "Roadstar Tire")}</h2>
+      <div style="font-size:15px;font-weight:600;color:#444;margin-bottom:14px">Wheel &amp; Tire Inspection Report</div>
+      <table style="border-collapse:collapse;margin-bottom:8px"><tr>
+        ${field("Customer", `${booking.firstName} ${booking.lastName}`)}${field("Vehicle", insp.vehicle)}${field("Plate", insp.plate)}
+      </tr><tr>
+        ${field("Mileage", insp.mileage)}${field("Date", booking.date)}${field("Technician", insp.technician)}
+      </tr></table>
+      ${anyFlagged ? sectionsHtml : `<p style="font-size:13px;color:#15803d">✓ No issues were flagged during this inspection.</p>`}
+      ${insp.notes ? `<div style="margin:14px 0"><div style="font-weight:700;font-size:14px">Recommendations / Notes</div><div style="font-size:13px;white-space:pre-wrap;margin-top:4px">${esc(insp.notes)}</div></div>` : ""}
+      <p style="font-size:11px;color:#888;border-top:1px solid #ddd;padding-top:10px;margin-top:18px">Disclaimer: Visual inspection only. Any identified issues should be inspected and repaired by a licensed mechanic.</p>
+    </div>`;
+}
+
+// ── PATCH /api/bookings/:id/inspection — save the inspection report ────────────
+router.patch("/bookings/:id/inspection", adminAuth, requirePermission("manage:bookings"),
+  [param("id").isUUID()], handleValidation,
+  async (req, res) => {
+    try {
+      const booking = await Bookings.findById(req.params.id);
+      if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+
+      const b = req.body || {};
+      const validIds = new Set(INSPECTION_SECTIONS.flatMap(s => s.items.map(([id]) => id)));
+      const checked = Array.isArray(b.checked) ? b.checked.filter(id => validIds.has(id)) : [];
+      const clip = (v, n) => (v == null ? "" : String(v).slice(0, n));
+      const inspection = {
+        vehicle:    clip(b.vehicle, 120),
+        plate:      clip(b.plate, 40),
+        mileage:    clip(b.mileage, 40),
+        roNumber:   clip(b.roNumber, 40),
+        technician: clip(b.technician, 80),
+        checked,
+        notes:      clip(b.notes, 2000),
+        updatedAt:  new Date().toISOString(),
+        updatedBy:  req.user?.name || req.user?.email || "staff",
+        emailedAt:  booking.inspection?.emailedAt || null,
+      };
+      const updated = await Bookings.update(req.params.id, req.shopId, { inspection });
+      if (!updated) return res.status(404).json({ success:false, message:"Not found" });
+      await createAuditLog(req, { action:"inspection_saved", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName} — ${checked.length} item(s) flagged` });
+      res.json({ success:true, message:"Inspection saved.", booking: updated });
+    } catch (err) { console.error("PATCH inspection:", err); res.status(500).json({ success:false, message:"Server error" }); }
+  }
+);
+
+// ── POST /api/bookings/:id/inspection/email — email report to the customer ─────
+router.post("/bookings/:id/inspection/email", adminAuth, requirePermission("manage:bookings"),
+  [param("id").isUUID(), body("email").optional({ checkFalsy:true }).trim().isEmail().normalizeEmail()],
+  handleValidation,
+  async (req, res) => {
+    try {
+      const booking = await Bookings.findById(req.params.id);
+      if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+      if (!booking.inspection) return res.status(400).json({ success:false, message:"Save the inspection before emailing it." });
+      const to = req.body.email || booking.email;
+      if (!to) return res.status(400).json({ success:false, message:"No email on file — enter one to send the report." });
+
+      const { config } = await loadConfig(req.shopId);
+      const shopName = config?.shopName || config?.settings?.shopName || "Roadstar Tire";
+      const html = buildInspectionEmail(booking, booking.inspection, shopName);
+      await sendEmail({ to, subject: `Wheel & Tire Inspection Report — ${booking.firstName} ${booking.lastName}`, html });
+
+      const inspection = { ...booking.inspection, emailedAt: new Date().toISOString() };
+      const updated = await Bookings.update(req.params.id, req.shopId, { inspection });
+      await createAuditLog(req, { action:"inspection_emailed", entity:"booking", entityId:req.params.id, entityLabel:`Sent to ${to}` });
+      res.json({ success:true, message:`Inspection report sent to ${to}`, booking: updated });
+    } catch (err) { console.error("POST inspection email:", err); res.status(500).json({ success:false, message:err.message || "Email failed" }); }
+  }
+);
 
 // ── POST /api/bookings/:id/sms — manual ──────────────────────────────────────
 router.post("/bookings/:id/sms", adminAuth, requirePermission("manage:bookings"),
