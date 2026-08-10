@@ -162,6 +162,7 @@ router.post("/book",
     body("tireQuantity").optional({ nullable: true, checkFalsy: true }).isInt({ min:1, max:50 }).toInt(),
     body("shopId").optional().trim(),
     body("emailConsent").optional().isBoolean(),
+    body("termsAgreed").optional().isBoolean(),
   ],
   handleValidation,
   async (req, res) => {
@@ -169,6 +170,13 @@ router.post("/book",
       const shopId = req.body.shopId || req.headers["x-shop-id"] || process.env.DEFAULT_SHOP_ID || "roadstar";
       const { config } = await loadConfig(shopId);
       const { firstName, lastName, phone, email, service, customService, date, time, tireSize, doesntKnowTireSize, tireQuantity } = req.body;
+
+      // Terms & Conditions: agreement is required for every booking (public form
+      // and staff walk-in). Recorded on the booking with a server-side timestamp.
+      const termsAgreed = req.body.termsAgreed === true || req.body.termsAgreed === "true";
+      if (!termsAgreed) {
+        return res.status(400).json({ success: false, message: "You must agree to the Terms & Conditions to book." });
+      }
 
       if (!getHoursForDate(date, config)) {
         return res.status(400).json({ success: false, message: "The shop is closed on this day." });
@@ -228,6 +236,8 @@ router.post("/book",
           doesntKnowTireSize: doesntKnowTireSize === true || doesntKnowTireSize === "true",
           tireQuantity:     Number.isInteger(tireQuantity) ? tireQuantity : null,
           emailConsent: req.body.emailConsent === true || req.body.emailConsent === "true" || false,
+          termsAgreed:   true,
+          termsAgreedAt: new Date().toISOString(),
           status:  bookingStatus,
           source:  bookingSource,
           deleted: false,
