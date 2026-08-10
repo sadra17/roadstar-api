@@ -727,6 +727,11 @@ const INSPECTION_SECTIONS = [
 ];
 const esc = s => String(s || "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
+// Public URL of the logo shown at the top of the report email. Hosted as a
+// static file on the dashboard (Vercel). Override with EMAIL_LOGO_URL if the
+// dashboard is on a different domain. Leave empty to fall back to a text header.
+const EMAIL_LOGO_URL = process.env.EMAIL_LOGO_URL || "https://dashboard.roadstartire.ca/email-logo.png";
+
 function buildInspectionEmail(booking, insp, shopName) {
   const checked = new Set(Array.isArray(insp.checked) ? insp.checked : []);
   const sectionsHtml = INSPECTION_SECTIONS.map(sec => {
@@ -739,7 +744,9 @@ function buildInspectionEmail(booking, insp, shopName) {
   const field = (l,v) => v ? `<td style="padding:3px 14px 3px 0;font-size:13px"><b>${esc(l)}:</b> ${esc(v)}</td>` : "";
   return `
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#111">
-      <h2 style="margin:0 0 2px">${esc(shopName || "Roadstar Tire")}</h2>
+      ${EMAIL_LOGO_URL
+        ? `<img src="${EMAIL_LOGO_URL}" alt="${esc(shopName || "Roadstar Tire")}" width="150" style="display:block;width:150px;max-width:150px;height:auto;margin:0 0 10px"/>`
+        : `<h2 style="margin:0 0 2px">${esc(shopName || "Roadstar Tire")}</h2>`}
       <div style="font-size:15px;font-weight:600;color:#444;margin-bottom:14px">Wheel &amp; Tire Inspection Report</div>
       <table style="border-collapse:collapse;margin-bottom:8px"><tr>
         ${field("Customer", `${booking.firstName} ${booking.lastName}`)}${field("Vehicle", insp.vehicle)}${field("Plate", insp.plate)}
