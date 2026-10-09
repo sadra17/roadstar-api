@@ -367,7 +367,19 @@ function groupByPhone(bookings) {
 function summarizeCustomer(bookings, today) {
   const recent = [...bookings].sort(byCreatedDesc);
   const latest = recent[0];
-  const c = { phone: latest.phone, firstName: latest.firstName, lastName: latest.lastName,
+  // Name = the one used most often for this phone (ties → most recent), so one booking
+  // made by someone else on the same number doesn't rename a regular customer.
+  const nameCount = new Map();
+  for (const b of recent) {
+    const n = `${(b.firstName || "").trim()} ${(b.lastName || "").trim()}`.trim();
+    if (!n) continue;
+    const prev = nameCount.get(n.toLowerCase()); // keep the newest booking for this name (list is newest first)
+    nameCount.set(n.toLowerCase(), { n: prev?.n || n, b: prev?.b || b, count: (prev?.count || 0) + 1 });
+  }
+  const ranked = [...nameCount.values()].sort((x, y) => y.count - x.count || recent.indexOf(x.b) - recent.indexOf(y.b));
+  const main = ranked[0]?.b || latest;
+  const c = { phone: latest.phone, firstName: main.firstName, lastName: main.lastName,
+    otherNames: ranked.slice(1).map(r => r.n),
     email: recent.find(b => b.email)?.email || "",
     visitCount: 0, bookingCount: 0, completedCount: 0, cancelledCount: 0, noShowCount: 0, bookings: recent,
     tireSizes: new Set(), services: new Set(), firstVisit: null, lastVisit: null, lastService: "",
