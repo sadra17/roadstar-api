@@ -97,7 +97,8 @@ function clearAttempts(email) {
 }
 
 function buildToken(payload, expiresIn) {
-  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: expiresIn || "8h" });
+  // jwtid makes every login's token unique, so signing out one session never ends another
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: expiresIn || "8h", jwtid: require("crypto").randomUUID() });
 }
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
@@ -191,6 +192,12 @@ router.post("/login", async (req, res) => {
       });
     }
 
+    // Deactivated staff account with the right password → tell them why (no leak to strangers)
+    const inactive = await Users.findOne({ email: emailLower, active: false, deleted: false });
+    if (inactive?.passwordHash && await bcrypt.compare(password, inactive.passwordHash)) {
+      return res.status(403).json({ success: false, message: "This account has been deactivated. Please contact the shop owner.", code: "ACCOUNT_INACTIVE" });
+    }
+
     // No match at any priority level
     recordFailure(emailLower); // S4: track as failed attempt
     res.status(401).json({ success: false, message: "Invalid credentials" });
@@ -240,6 +247,11 @@ router.get("/me", adminAuth, async (req, res) => {
 
 // ── POST /api/auth/logout ─────────────────────────────────────────────────────
 router.post("/logout", adminAuth, async (req, res) => {
+  // End this session on the server too, not only in the browser
+  try {
+    const token = req.headers["authorization"].slice(7);
+    require("../middleware/adminAuth").revokeToken(token, jwt.decode(token)?.exp);
+  } catch (err) { console.error("[Auth] revoke on logout:", err.message); }
   await createAuditLog(req, { action: "logout", entity: "login", entityLabel: req.user.email });
   res.json({ success: true, message: "Logged out" });
 });

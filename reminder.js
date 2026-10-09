@@ -6,11 +6,12 @@
 const { DateTime } = require("luxon");
 const { Bookings, SmsLog, ShopSettings } = require("./lib/db");
 const { buildShopConfig, renderSmsTemplate, display12To24, toMinutes } = require("./config/business");
+const { toE164 } = require("./lib/phone");
 
 async function sendTwilioSMS(to, body) {
   if (!process.env.TWILIO_ACCOUNT_SID) return null;
   const client = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  return client.messages.create({ body, from: process.env.TWILIO_PHONE_NUMBER, to });
+  return client.messages.create({ body, from: process.env.TWILIO_PHONE_NUMBER, to: toE164(to) });
 }
 
 // ── Shared SMS send + log helper ──────────────────────────────────────────────

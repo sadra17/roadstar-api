@@ -139,13 +139,22 @@ function fromMinutes(mins) {
   return `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
 }
 
+// "9:30 AM" / "9:30am" / "14:00" / "9:30" → "09:30" / "14:00". Returns null for
+// anything that isn't a real clock time ("25:99", "13:00 PM", "banana").
 function display12To24(str) {
-  if (!str) return null;
-  if (/^\d{2}:\d{2}$/.test(str)) return str;
-  const m = str.match(/^(\d+):(\d{2})\s*(AM|PM)$/i);
+  if (typeof str !== "string") return null;
+  const s = str.trim();
+  const m24 = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (m24) {
+    const h = parseInt(m24[1], 10), mn = parseInt(m24[2], 10);
+    if (h > 23 || mn > 59) return null;
+    return `${String(h).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
+  }
+  const m = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (!m) return null;
   let h = parseInt(m[1], 10);
   const mn = parseInt(m[2], 10);
+  if (h < 1 || h > 12 || mn > 59) return null;
   if (m[3].toUpperCase() === "PM" && h !== 12) h += 12;
   if (m[3].toUpperCase() === "AM" && h === 12) h = 0;
   return `${String(h).padStart(2,"0")}:${String(mn).padStart(2,"0")}`;
@@ -156,6 +165,25 @@ function display24To12(hhmm) {
   const p   = h >= 12 ? "PM" : "AM";
   const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
   return `${h12}:${String(m).padStart(2,"0")} ${p}`;
+}
+
+// Canonical stored/display format: "2:00 PM". null if the input isn't a valid time.
+function normalizeTime(str) {
+  const t24 = display12To24(str);
+  return t24 ? display24To12(t24) : null;
+}
+
+// Sort key in minutes for "h:mm AM/PM" strings; unparseable times sort last.
+function timeSortKey(str) {
+  const t24 = display12To24(str);
+  return t24 ? toMinutes(t24) : Infinity;
+}
+
+// True only for a real calendar date written exactly as YYYY-MM-DD (rejects 2026-02-30).
+function isRealDate(str) {
+  if (typeof str !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
+  const d = DateTime.fromISO(str, { zone: "utc" });
+  return d.isValid && d.toISODate() === str;
 }
 
 function generateSlots(dateStr, serviceName, shopConfig) {
@@ -282,6 +310,6 @@ module.exports = {
   buildShopConfig, renderSmsTemplate,
   resolveService, resolvedDuration, resolvedOccupation, effectiveOccupation,
   poolCapacity, getHoursForDate, toMinutes, fromMinutes,
-  display12To24, display24To12, generateSlots, occupancyDuring,
+  display12To24, display24To12, normalizeTime, timeSortKey, isRealDate, generateSlots, occupancyDuring,
   computeAvailability, validateCapacity,
 };

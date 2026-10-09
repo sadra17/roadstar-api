@@ -10,22 +10,29 @@ const { requirePermission } = require("../middleware/adminAuth");
 
 router.get("/audit-log", adminAuth, requirePermission("view:audit_log"), async (req, res) => {
   try {
-    const page  = Math.max(1, parseInt(req.query.page  || "1", 10));
-    const limit = Math.min(200, parseInt(req.query.limit || "50", 10));
+    // Query values must be single strings (?page=1&page=2 arrives as an array)
+    const q = k => (typeof req.query[k] === "string" ? req.query[k].trim() : "");
+    const page  = Math.max(1, parseInt(q("page"), 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(q("limit"), 10) || 50));
 
     const filter = {};
     if (!req.user._isSuperAdmin) filter.shop_id = req.shopId;
-    else if (req.query.shopId)   filter.shop_id = req.query.shopId;
+    else if (q("shopId"))        filter.shop_id = q("shopId");
 
-    if (req.query.entity)   filter.entity   = req.query.entity;
-    if (req.query.action)   filter.action   = req.query.action;
-    if (req.query.userId)   filter.user_id  = req.query.userId;
-    if (req.query.entityId) filter.entity_id= req.query.entityId;
+    // Texts are logged as action "sms_sent" on the booking (entity "booking"), so the
+    // "sms_sent" filter means the action, whichever parameter it arrives in.
+    if (q("entity") === "sms_sent") filter.action = "sms_sent";
+    else if (q("entity")) filter.entity = q("entity");
+    if (q("action"))   filter.action   = q("action");
+    if (q("userId"))   filter.user_id  = q("userId");
+    if (q("entityId")) filter.entity_id= q("entityId");
 
-    if (req.query.from || req.query.to) {
+    if (q("from") || q("to")) {
+      const from = q("from") ? new Date(q("from")) : null, to = q("to") ? new Date(q("to")) : null;
+      if ((from && isNaN(from)) || (to && isNaN(to))) return res.status(400).json({ success: false, message: "Invalid from/to date" });
       filter.created_at = {};
-      if (req.query.from) filter.created_at.$gte = new Date(req.query.from).toISOString();
-      if (req.query.to)   filter.created_at.$lte = new Date(req.query.to).toISOString();
+      if (from) filter.created_at.$gte = from.toISOString();
+      if (to)   filter.created_at.$lte = to.toISOString();
     }
 
     const { logs, total } = await AuditLogs.find(filter, page, limit);

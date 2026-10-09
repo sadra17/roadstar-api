@@ -81,7 +81,15 @@ app.use("/api",      shopRoutes);
 
 app.get("/health", (_req,res) => res.json({ status:"ok", version:"9.0-supabase", db:"supabase", time:new Date().toISOString() }));
 app.use((_req,res) => res.status(404).json({ success:false, message:"Route not found" }));
-app.use((err,_req,res,_next) => { console.error(err.message); res.status(500).json({ success:false, message:"Server error" }); });
+app.use((err,_req,res,_next) => {
+  // Body-parser errors are the client's fault: bad JSON → 400, body over the 10kb limit → 413.
+  if (err.type === "entity.parse.failed") return res.status(400).json({ success:false, message:"The request body is not valid JSON." });
+  if (err.type === "entity.too.large")   return res.status(413).json({ success:false, message:"The request is too large." });
+  const status = Number(err.status || err.statusCode);
+  if (status >= 400 && status < 500) return res.status(status).json({ success:false, message: err.expose && err.message ? err.message : "Bad request" });
+  console.error(err.message);
+  res.status(500).json({ success:false, message:"Server error" });
+});
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => console.log(`Roadstar API v9-supabase on port ${PORT}`));

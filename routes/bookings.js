@@ -9,7 +9,7 @@ const { Bookings, SmsLog, ShopSettings } = require("../lib/db");
 const { sendEmail } = require("../lib/email");
 const adminAuth = require("../middleware/adminAuth");
 const { requirePermission } = require("../middleware/adminAuth");
-const { handleValidation }  = require("../middleware/validate");
+const { handleValidation, isPhone, rejectNested } = require("../middleware/validate");
 const { createAuditLog }    = require("../middleware/audit");
 const { getOrCreate }       = require("./settings");
 const {
@@ -18,9 +18,12 @@ const {
   resolveService, resolvedOccupation,
   computeAvailability, validateCapacity, getHoursForDate,
   display12To24, toMinutes, generateSlots,
+  normalizeTime, timeSortKey, isRealDate,
 } = require("../config/business");
+const { toE164 } = require("../lib/phone");
 
 const jwt = require("jsonwebtoken");
+const { DateTime } = require("luxon");
 
 const SOFT_DELETE_DAYS = 15;
 
@@ -56,7 +59,7 @@ async function loadConfig(shopId) {
 async function sendTwilioSMS(to, msgBody) {
   if (!process.env.TWILIO_ACCOUNT_SID) { console.warn("[SMS] Twilio not configured"); return null; }
   const client = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  return client.messages.create({ body: msgBody, from: process.env.TWILIO_PHONE_NUMBER, to });
+  return client.messages.create({ body: msgBody, from: process.env.TWILIO_PHONE_NUMBER, to: toE164(to) });
 }
 
 function buildSmsBody(messageType, booking, shopConfig) {
@@ -93,9 +96,15 @@ async function sendAndLog(bookingId, shopId, to, messageType, msgBody) {
   const entry = { bookingId, shopId, messageType, body: msgBody, sentAt: new Date().toISOString() };
   try {
     const msg    = await sendTwilioSMS(to, msgBody);
-    entry.status    = "sent";
-    entry.twilioSid = msg?.sid || null;
-    console.log(`[SMS] ${messageType} → ${to}`);
+    if (!msg) {
+      // Twilio isn't set up — nothing was sent, so don't log it as "sent"
+      entry.status = "failed";
+      entry.error  = "SMS is not set up for this shop";
+    } else {
+      entry.status    = "sent";
+      entry.twilioSid = msg.sid || null;
+      console.log(`[SMS] ${messageType} → ${to}`);
+    }
   } catch (err) {
     entry.status = "failed";
     entry.error  = err.message;
@@ -104,6 +113,12 @@ async function sendAndLog(bookingId, shopId, to, messageType, msgBody) {
   await SmsLog.create(entry);
   await Bookings.markSmsSent(bookingId);
   return entry;
+}
+
+// Every text we send shows up in the Audit Log under "sms_sent".
+async function logSmsAudit(req, booking, messageType, log) {
+  await createAuditLog(req, { action:"sms_sent", entity:"booking", entityId:booking.id,
+    entityLabel:`${booking.firstName} ${booking.lastName}`, meta:{ messageType, status:log.status } });
 }
 
 // ── GET /api/business-hours (public) ─────────────────────────────────────────
@@ -130,7 +145,7 @@ router.get("/business-hours", async (req, res) => {
 
 // ── GET /api/availability (public) ───────────────────────────────────────────
 router.get("/availability",
-  [query("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/), query("service").optional().trim(), query("shopId").optional().trim()],
+  [query("date").isString().bail().trim().custom(isRealDate).withMessage("Please choose a valid date."), query("service").optional().isString().bail().trim(), query("shopId").optional().isString().bail().trim()],
   handleValidation,
   async (req, res) => {
     try {
@@ -149,19 +164,23 @@ router.get("/availability",
 
 // ── POST /api/book (public) ───────────────────────────────────────────────────
 router.post("/book",
+  rejectNested,
   [
-    body("firstName").trim().notEmpty().isLength({ max:60 }),
-    body("lastName").trim().notEmpty().isLength({ max:60 }),
-    body("phone").trim().notEmpty().matches(/^[\d\s\-\(\)\+]{7,20}$/),
-    body("email").optional({ checkFalsy: true }).trim().isEmail().normalizeEmail(),
-    body("service").trim().notEmpty(),
-    body("customService").optional().trim().isLength({ max:300 }),
-    body("date").trim().matches(/^\d{4}-\d{2}-\d{2}$/),
-    body("time").trim().notEmpty(),
-    body("tireSize").optional().trim().isLength({ max:50 }),
+    // isString() matters: express-validator checks each element of an array on its own,
+    // so ["2026-11-03"] would otherwise pass and be saved as text.
+    body("firstName").isString().bail().trim().notEmpty().withMessage("Please enter your first name.").isLength({ max:60 }).withMessage("First name must be 60 characters or fewer."),
+    body("lastName").isString().bail().trim().notEmpty().withMessage("Please enter your last name.").isLength({ max:60 }).withMessage("Last name must be 60 characters or fewer."),
+    body("phone").custom(isPhone).withMessage("Please enter a valid phone number, like 416-555-0000.").bail().trim(),
+    body("email").optional({ checkFalsy: true }).isString().bail().trim().isEmail().withMessage("Please enter a valid email address, like name@gmail.com.").normalizeEmail(),
+    body("service").isString().bail().trim().notEmpty(),
+    body("customService").optional({ nullable: true }).isString().bail().trim().isLength({ max:300 }),
+    body("date").isString().bail().trim().custom(isRealDate).withMessage("Please choose a valid date."),
+    // Stored in one format ("2:00 PM") so it sorts, displays and matches the dropdowns
+    body("time").custom(v => normalizeTime(v) !== null).withMessage("Please choose a valid time, like 2:00 PM.").bail().customSanitizer(normalizeTime),
+    body("tireSize").optional({ nullable: true }).isString().bail().trim().isLength({ max:50 }),
     body("doesntKnowTireSize").optional().isBoolean(),
     body("tireQuantity").optional({ nullable: true, checkFalsy: true }).isInt({ min:1, max:50 }).toInt(),
-    body("shopId").optional().trim(),
+    body("shopId").optional().isString().bail().trim(),
     body("emailConsent").optional().isBoolean(),
     body("termsAgreed").optional().isBoolean(),
   ],
@@ -193,8 +212,8 @@ router.post("/book",
       // API7: validate that the requested time slot actually exists for this date+service
       // (prevents booking into slots outside business hours or non-15-min-boundary times)
       const validSlots = generateSlots(date, service, config);
-      const slot24 = display12To24(time) || time;
-      const isValidSlot = validSlots.some(s => (display12To24(s) || s) === slot24);
+      const slot24 = display12To24(time);
+      const isValidSlot = validSlots.some(s => display12To24(s) === slot24);
       if (!isValidSlot) {
         return res.status(400).json({ success: false, message: "That time slot is not available for this service on this date." });
       }
@@ -215,6 +234,22 @@ router.post("/book",
             if (["pending","confirmed"].includes(req.body.status)) bookingStatus = req.body.status;
           }
         } catch {} // invalid/expired token — default to pending/online
+      }
+
+      // Not in the past (online bookings only — staff may log a walk-in after the fact)
+      // and not absurdly far ahead (e.g. year 9999).
+      {
+        const now = DateTime.now().setZone(config?.tz || "America/Toronto");
+        const today = now.toISODate();
+        if (bookingSource === "online") {
+          if (date < today || (date === today && toMinutes(slot24) <= now.hour * 60 + now.minute)) {
+            return res.status(400).json({ success: false, message: "That time has already passed. Please pick a later time." });
+          }
+        }
+        const maxAhead = now.plus({ years: bookingSource === "online" ? 1 : 2 }).toISODate();
+        if (date > maxAhead) {
+          return res.status(400).json({ success: false, message: "That date is too far ahead. Please pick an earlier date or call us." });
+        }
       }
 
       // Lock key: shopId|date|resourcePool — only serialize bookings that compete
@@ -306,44 +341,106 @@ router.get("/recently-deleted", adminAuth, requirePermission("view:bookings"), a
   }
 });
 
+// ── Customers (CRM) ───────────────────────────────────────────────────────────
+// A customer is every booking that shares the same phone digits, so "416.555.0000"
+// and "(416) 555-0000" are one person. List, profile and CSV export all build their
+// numbers here so they always agree.
+const phoneKey = p => String(p || "").replace(/\D/g, "").slice(-10);
+const byCreatedDesc = (a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")) || String(b.date || "").localeCompare(String(a.date || ""));
+// Bookings that didn't actually happen don't count as a visit
+const NOT_A_VISIT = ["cancelled", "no_show", "waitlist"];
+
+function groupByPhone(bookings) {
+  const groups = new Map();
+  for (const b of bookings) {
+    const key = phoneKey(b.phone) || String(b.phone || "");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(b);
+  }
+  return groups;
+}
+
+// Stats for one customer from ALL of their bookings. Name/email come from the most
+// recently made booking (the latest details they gave us).
+// visitCount / lastVisit only count real visits: up to today and not cancelled,
+// a no-show or a waitlist entry. bookingCount is every booking.
+function summarizeCustomer(bookings, today) {
+  const recent = [...bookings].sort(byCreatedDesc);
+  const latest = recent[0];
+  const c = { phone: latest.phone, firstName: latest.firstName, lastName: latest.lastName,
+    email: recent.find(b => b.email)?.email || "",
+    visitCount: 0, bookingCount: 0, completedCount: 0, cancelledCount: 0, noShowCount: 0, bookings: recent,
+    tireSizes: new Set(), services: new Set(), firstVisit: null, lastVisit: null, lastService: "",
+    nextBooking: null, totalSpent: 0 };
+  for (const b of recent) {
+    c.bookingCount++;
+    if (b.status === "completed") c.completedCount++;
+    if (b.status === "cancelled") c.cancelledCount++;
+    if (b.status === "no_show") c.noShowCount++;
+    if (b.paymentStatus === "paid" && b.finalPrice) c.totalSpent += Number(b.finalPrice);
+    c.services.add(b.service);
+    if (b.tireSize) c.tireSizes.add(b.tireSize);
+    if (b.doesntKnowTireSize && !b.tireSize) c.tireSizes.add("Doesn't know size");
+    const visited = isRealDate(b.date) && b.date <= today && !NOT_A_VISIT.includes(b.status);
+    if (visited) {
+      c.visitCount++;
+      if (!c.firstVisit || b.date < c.firstVisit) c.firstVisit = b.date;
+      if (!c.lastVisit || b.date > c.lastVisit) { c.lastVisit = b.date; c.lastService = b.service; }
+    }
+    if (isRealDate(b.date) && b.date >= today && ["pending","confirmed"].includes(b.status) && (!c.nextBooking || b.date < c.nextBooking.date || (b.date === c.nextBooking.date && timeSortKey(b.time) < timeSortKey(c.nextBooking.time)))) c.nextBooking = { date: b.date, time: b.time, service: b.service };
+  }
+  return { ...c, tireSizes: [...c.tireSizes], services: [...c.services], totalSpent: Math.round(c.totalSpent*100)/100 };
+}
+
+// Free-text search over a customer's bookings. Plain JS (no user input is ever put into
+// a database filter), so commas, brackets, % and _ are just characters.
+//   • phone-looking input matches on digits, in any format ("4165550102", "(416) 555-0102", "416 555")
+//   • otherwise every word must appear in one booking's name / email / phone ("Bob Seed", "Seed, Bob")
+function customerMatches(bookings, search) {
+  const q = search.trim().toLowerCase();
+  if (!q) return true;
+  const qDigits = q.replace(/\D/g, "");
+  const phoneLike = /^[\d\s\-().+]+$/.test(q) && qDigits.length >= 3;
+  const terms = q.split(/[\s,]+/).filter(Boolean);
+  return bookings.some(b => {
+    if (phoneLike) {
+      const d = String(b.phone || "").replace(/\D/g, "");
+      if (d.includes(qDigits) || (qDigits.length === 11 && qDigits[0] === "1" && d.includes(qDigits.slice(1)))) return true;
+    }
+    const hay = [b.firstName, b.lastName, b.email, b.phone].map(v => String(v || "").toLowerCase()).join(" ");
+    return terms.every(t => hay.includes(t));
+  });
+}
+
+async function shopToday(shopId) {
+  const { config } = await loadConfig(shopId);
+  return DateTime.now().setZone(config?.tz || "America/Toronto").toISODate();
+}
+
+// Most visits first, then most recent visit.
+const byVisitsThenLast = (a, b) => b.visitCount - a.visitCount || (b.lastVisit || "").localeCompare(a.lastVisit || "");
+
 // ── GET /api/customers — admin ────────────────────────────────────────────────
 router.get("/customers", adminAuth, requirePermission("view:customers"), async (req, res) => {
   try {
-    const { search } = req.query;
-    const filter = { shop_id: req.shopId, deleted: false };
+    // ?search=a&search=b arrives as an array — search for all of it
+    const raw = req.query.search;
+    const search = (Array.isArray(raw) ? raw.filter(v => typeof v === "string").join(" ") : typeof raw === "string" ? raw : "").slice(0, 100);
 
-    // BE7: use Supabase ilike for server-side search instead of loading all rows into memory.
-    // Searches first_name, last_name, phone, email independently (OR). Combined full-name
-    // search (e.g. "John Smith") is not supported at DB level but covers the common cases.
-    const findOpts = { orderBy: { col: "created_at", asc: false } };
-    if (search) {
-      findOpts.orSearch = [
-        ["first_name", search], ["last_name", search],
-        ["phone", search], ["email", search],
-      ];
-    }
-    const bookings = await Bookings.find(filter, findOpts);
-    const filtered = bookings;
+    // Load every booking and match in JS: matching first and then grouping would build
+    // each customer from the matching bookings only (wrong visit counts and totals).
+    const bookings = await Bookings.find({ shop_id: req.shopId, deleted: false }, { orderBy: { col: "created_at", asc: false } });
+    const today = await shopToday(req.shopId);
 
-    const map = {};
-    for (const b of filtered) {
-      const key = b.phone;
-      if (!map[key]) map[key] = { phone: b.phone, firstName: b.firstName, lastName: b.lastName, email: b.email || "", visitCount: 0, completedCount: 0, bookings: [], tireSizes: new Set(), services: new Set(), lastVisit: b.date, totalSpent: 0 };
-      const c = map[key];
-      if (b.email && !c.email) c.email = b.email;
-      c.visitCount++;
-      if (b.status === "completed") { c.completedCount++; if (b.paymentStatus === "paid" && b.finalPrice) c.totalSpent += b.finalPrice; }
-      c.bookings.push(b);
-      c.services.add(b.service);
-      if (b.tireSize) c.tireSizes.add(b.tireSize);
-      if (b.doesntKnowTireSize && !b.tireSize) c.tireSizes.add("Doesn't know size");
-      if (b.date > c.lastVisit) c.lastVisit = b.date;
+    const customers = [];
+    for (const group of groupByPhone(bookings).values()) {
+      if (search && !customerMatches(group, search)) continue;
+      customers.push(summarizeCustomer(group, today));
     }
-    const customers = Object.values(map)
-      .map(c => ({ ...c, tireSizes: [...c.tireSizes], services: [...c.services], totalSpent: Math.round(c.totalSpent*100)/100 }))
-      .sort((a, b) => b.visitCount - a.visitCount);
+    customers.sort(byVisitsThenLast);
     res.json({ success: true, count: customers.length, customers });
   } catch (err) {
+    console.error("GET /api/customers:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
@@ -352,43 +449,32 @@ router.get("/customers", adminAuth, requirePermission("view:customers"), async (
 router.get("/customers/export", adminAuth, requirePermission("export:customers"), async (req, res) => {
   try {
     const bookings = await Bookings.find({ shop_id: req.shopId, deleted: false }, { orderBy: { col: "created_at", asc: false } });
-    const map = {};
-    for (const b of bookings) {
-      const key = b.phone;
-      if (!map[key]) map[key] = { firstName:b.firstName, lastName:b.lastName, phone:b.phone, email:b.email||"", visitCount:0, completedCount:0, lastVisit:b.date, lastService:b.service, totalSpent:0, tireSizes:new Set() };
-      const c = map[key]; if (b.email && !c.email) c.email = b.email;
-      c.visitCount++;
-      if (b.status==="completed") { c.completedCount++; if (b.paymentStatus==="paid"&&b.finalPrice) c.totalSpent+=b.finalPrice; if (b.date>=c.lastVisit) { c.lastVisit=b.date; c.lastService=b.service; } }
-      if (b.tireSize) c.tireSizes.add(b.tireSize);
-    }
-    const rows = Object.values(map);
+    const today = await shopToday(req.shopId);
+    // Same grouping and totals as the CRM list (one row per customer)
+    const rows = [...groupByPhone(bookings).values()].map(g => summarizeCustomer(g, today)).sort(byVisitsThenLast);
     const header = "First Name,Last Name,Phone,Email,Visits,Completed,Total Spent,Last Visit,Last Service,Tire Sizes";
-    const csv = [header, ...rows.map(c => [c.firstName,c.lastName,c.phone,c.email,c.visitCount,c.completedCount,(c.totalSpent).toFixed(2),c.lastVisit,c.lastService,[...c.tireSizes].join("|")].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","))].join("\n");
+    const csv = [header, ...rows.map(c => [c.firstName,c.lastName,c.phone,c.email,c.visitCount,c.completedCount,(c.totalSpent).toFixed(2),c.lastVisit||"",c.lastService,c.tireSizes.join("|")].map(v=>`"${String(v ?? "").replace(/"/g,'""')}"`).join(","))].join("\n");
     await createAuditLog(req, { action:"export", entity:"customer", entityLabel:`${rows.length} customers exported` });
     res.setHeader("Content-Type","text/csv");
     res.setHeader("Content-Disposition",`attachment; filename="customers-${req.shopId}-${new Date().toISOString().slice(0,10)}.csv"`);
     res.send(csv);
-  } catch (err) { res.status(500).json({ success:false, message:"Server error" }); }
+  } catch (err) { console.error("GET /api/customers/export:", err); res.status(500).json({ success:false, message:"Server error" }); }
 });
 
 // ── GET /api/customers/by-phone/:phone ───────────────────────────────────────
 router.get("/customers/by-phone/:phone", adminAuth, requirePermission("view:customers"), async (req, res) => {
   try {
-    const phone = decodeURIComponent(req.params.phone);
-    const bookings = await Bookings.find({ shop_id: req.shopId, phone, deleted: false }, { orderBy: { col: "date", asc: false } });
+    const phone = req.params.phone;
+    // Match on phone digits so every format the customer used is included
+    const key = phoneKey(phone);
+    const bookings = (await Bookings.find({ shop_id: req.shopId, deleted: false }, { orderBy: { col: "date", asc: false } }))
+      .filter(b => key ? phoneKey(b.phone) === key : b.phone === phone);
     if (!bookings.length) return res.status(404).json({ success:false, message:"Customer not found" });
-    const latest = bookings[0];
-    const profile = {
-      phone, firstName: latest.firstName, lastName: latest.lastName, email: bookings.find(b=>b.email)?.email||"",
-      visitCount: bookings.length, completedCount: bookings.filter(b=>b.status==="completed").length,
-      noShowCount: bookings.filter(b=>b.status==="no_show").length,
-      totalSpent: Math.round(bookings.filter(b=>b.paymentStatus==="paid").reduce((s,b)=>s+(b.finalPrice||0),0)*100)/100,
-      tireSizes: [...new Set(bookings.filter(b=>b.tireSize).map(b=>b.tireSize))],
-      services:  [...new Set(bookings.map(b=>b.service))],
-      firstVisit: bookings[bookings.length-1].date, lastVisit: bookings[0].date, bookings,
-    };
+    const today = await shopToday(req.shopId);
+    // Same numbers as the list; the profile shows the bookings newest date first
+    const profile = { ...summarizeCustomer(bookings, today), phone, bookings };
     res.json({ success:true, customer:profile });
-  } catch (err) { res.status(500).json({ success:false, message:"Server error" }); }
+  } catch (err) { console.error("GET /api/customers/by-phone:", err); res.status(500).json({ success:false, message:"Server error" }); }
 });
 
 // ── GET /api/live-bay — admin/mechanic ───────────────────────────────────────
@@ -407,10 +493,9 @@ router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (re
     const nowMins      = now.hour*60+now.minute;
     const nowMs        = now.toMillis();
 
-    const todayAll = await Bookings.find(
-      { shop_id: req.shopId, date: todayStr, deleted: false },
-      { orderBy: { col: "time", asc: true } }
-    );
+    // Times are "h:mm AM/PM" text, so the database would sort "1:00 PM" before "9:30 AM".
+    const todayAll = (await Bookings.find({ shop_id: req.shopId, date: todayStr, deleted: false }))
+      .sort((a, b) => timeSortKey(a.time) - timeSortKey(b.time));
 
     const active = [], ready = [], upcoming = [];
     for (const b of todayAll) {
@@ -458,15 +543,30 @@ router.get("/live-bay", adminAuth, requirePermission("view:live_bay"), async (re
 router.patch("/bookings/:id/bay-start", adminAuth, requirePermission("manage:live_bay"), [param("id").isUUID()], handleValidation, async (req, res) => {
   try {
     const booking = await Bookings.findById(req.params.id);
-    if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+    if (!booking || booking.shopId !== req.shopId || booking.deleted) return res.status(404).json({ success:false, message:"Not found" });
     if (booking.bayStartedAt && !booking.bayEndedAt) {
       return res.json({ success:true, booking, message:"Already in a bay." });
     }
     const startedAt = new Date().toISOString();
     // Starting also confirms the booking if it was still pending/waitlist
     const updates = { bayStartedAt: startedAt, bayEndedAt: null, bayDurationMinutes: null };
-    if (["pending","waitlist"].includes(booking.status)) updates.status = "confirmed";
-    const updated = await Bookings.update(req.params.id, req.shopId, updates);
+    let updated;
+    if (["pending","waitlist"].includes(booking.status)) {
+      // Confirming takes a bay — same capacity check (and slot lock) as the Confirm button
+      updates.status = "confirmed";
+      const { config } = await loadConfig(req.shopId);
+      const def = resolveService(booking.service, config);
+      const result = await withSlotLock(`${req.shopId}|${booking.date}|${def.resourcePool}`, async () => {
+        const cap = await validateCapacity(booking.date, booking.time, booking.service, req.shopId, booking.id, config);
+        if (!cap.ok) return { conflict: cap.reason };
+        return { updated: await Bookings.update(req.params.id, req.shopId, updates) };
+      });
+      if (result.conflict) return res.status(409).json({ success:false, message: result.conflict });
+      updated = result.updated;
+    } else {
+      updated = await Bookings.update(req.params.id, req.shopId, updates);
+    }
+    if (!updated) return res.status(404).json({ success:false, message:"Not found" });
     await createAuditLog(req, { action:"bay_start", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, meta:{ startedAt } });
     if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_updated", { id:req.params.id, booking:updated });
     res.json({ success:true, booking:updated, message:"Car is now live at bay." });
@@ -477,11 +577,12 @@ router.patch("/bookings/:id/bay-start", adminAuth, requirePermission("manage:liv
 router.patch("/bookings/:id/bay-end", adminAuth, requirePermission("manage:live_bay"), [param("id").isUUID()], handleValidation, async (req, res) => {
   try {
     const booking = await Bookings.findById(req.params.id);
-    if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+    if (!booking || booking.shopId !== req.shopId || booking.deleted) return res.status(404).json({ success:false, message:"Not found" });
     if (!booking.bayStartedAt) return res.status(400).json({ success:false, message:"This car was never started." });
     const endedAt    = new Date().toISOString();
     const durationMinutes = Math.max(0, Math.round((new Date(endedAt) - new Date(booking.bayStartedAt)) / 60000));
     const updated = await Bookings.update(req.params.id, req.shopId, { bayEndedAt: endedAt, bayDurationMinutes: durationMinutes });
+    if (!updated) return res.status(404).json({ success:false, message:"Not found" });
     await createAuditLog(req, { action:"bay_end", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, meta:{ durationMinutes } });
     if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_updated", { id:req.params.id, booking:updated });
     res.json({ success:true, booking:updated, durationMinutes, message:`In the shop for ${durationMinutes} min.` });
@@ -489,7 +590,7 @@ router.patch("/bookings/:id/bay-end", adminAuth, requirePermission("manage:live_
 });
 
 // ── PATCH /api/bookings/:id/bay-snooze ───────────────────────────────────────
-router.patch("/bookings/:id/bay-snooze", adminAuth, requirePermission("view:live_bay"), async (req, res) => {
+router.patch("/bookings/:id/bay-snooze", adminAuth, requirePermission("view:live_bay"), [param("id").isUUID()], handleValidation, async (req, res) => {
   try {
     const { DateTime } = require("luxon"); const { config } = await loadConfig(req.shopId);
     const snoozeUntil = DateTime.now().setZone(config?.tz||"America/Toronto").plus({minutes:10}).toJSDate().toISOString();
@@ -505,9 +606,10 @@ router.patch("/bookings/:id/extend-bay", adminAuth, requirePermission("manage:li
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
+      if (!booking||booking.shopId!==req.shopId||booking.deleted) return res.status(404).json({success:false,message:"Not found"});
       const newExt = (booking.bayTimeExtendedBy||0) + req.body.minutes;
       const updated = await Bookings.update(req.params.id, req.shopId, { bayTimeExtendedBy: newExt });
+      if (!updated) return res.status(404).json({success:false,message:"Not found"});
       await createAuditLog(req, { action:"extend_bay", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, field:"bayTimeExtendedBy", before:booking.bayTimeExtendedBy||0, after:newExt, meta:{addedMinutes:req.body.minutes} });
       res.json({ success:true, booking:updated, message:`Bay time extended by ${req.body.minutes} min` });
     } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
@@ -516,12 +618,14 @@ router.patch("/bookings/:id/extend-bay", adminAuth, requirePermission("manage:li
 
 // ── PATCH /api/bookings/:id/mechanic ─────────────────────────────────────────
 router.patch("/bookings/:id/mechanic", adminAuth, requirePermission("manage:mechanic"),
-  [param("id").isUUID(), body("mechanicNotes").trim().isLength({max:2000})], handleValidation,
+  rejectNested,
+  [param("id").isUUID(), body("mechanicNotes").isString().bail().trim().isLength({max:2000})], handleValidation,
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
+      if (!booking||booking.shopId!==req.shopId||booking.deleted) return res.status(404).json({success:false,message:"Not found"});
       const updated = await Bookings.update(req.params.id, req.shopId, { mechanicNotes: req.body.mechanicNotes });
+      if (!updated) return res.status(404).json({success:false,message:"Not found"});
       await createAuditLog(req, { action:"updated", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName}`, field:"mechanicNotes", before:booking.mechanicNotes, after:req.body.mechanicNotes });
       res.json({ success:true, booking:updated });
     } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
@@ -530,18 +634,20 @@ router.patch("/bookings/:id/mechanic", adminAuth, requirePermission("manage:mech
 
 // ── PATCH /api/bookings/:id/payment ──────────────────────────────────────────
 router.patch("/bookings/:id/payment", adminAuth, requirePermission("manage:prices"),
+  rejectNested,
   [
     param("id").isUUID(),
-    body("quotedPrice").optional().isFloat({min:0}),
-    body("finalPrice").optional().isFloat({min:0}),
-    body("paymentMethod").optional().isIn(["cash","card","cheque","e-transfer","other"]),
-    body("paymentStatus").optional().isIn(["unpaid","paid","partial","refunded"]),
-    body("paymentNotes").optional().trim().isLength({max:500}),
+    // null clears a value. Capped so a typo like 1e308 is a clear 422 instead of a database overflow.
+    body("quotedPrice").optional({ nullable: true }).isFloat({min:0,max:100000}).withMessage("Price must be between $0 and $100,000.").toFloat(),
+    body("finalPrice").optional({ nullable: true }).isFloat({min:0,max:100000}).withMessage("Price must be between $0 and $100,000.").toFloat(),
+    body("paymentMethod").optional({ nullable: true }).isString().bail().isIn(["cash","card","cheque","e-transfer","other"]).withMessage("Please choose a payment method from the list."),
+    body("paymentStatus").optional().isString().bail().isIn(["unpaid","paid","partial","refunded"]).withMessage("Please choose a payment status from the list."),
+    body("paymentNotes").optional({ nullable: true }).isString().bail().trim().isLength({max:500}).withMessage("Payment notes must be 500 characters or fewer."),
   ], handleValidation,
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
+      if (!booking||booking.shopId!==req.shopId||booking.deleted) return res.status(404).json({success:false,message:"Not found"});
       const { quotedPrice, finalPrice, paymentMethod, paymentStatus, paymentNotes } = req.body;
       const before = { quotedPrice:booking.quotedPrice, finalPrice:booking.finalPrice, paymentMethod:booking.paymentMethod, paymentStatus:booking.paymentStatus };
       // Only pass userId if it's a real UUID (not 'env-admin' or 'system')
@@ -551,61 +657,80 @@ router.patch("/bookings/:id/payment", adminAuth, requirePermission("manage:price
       if (finalPrice!==undefined)  updates.finalPrice=finalPrice;
       if (paymentMethod!==undefined) updates.paymentMethod=paymentMethod;
       if (paymentStatus!==undefined) updates.paymentStatus=paymentStatus;
-      if (paymentNotes!==undefined)  updates.paymentNotes=paymentNotes;
+      if (paymentNotes!==undefined)  updates.paymentNotes=paymentNotes ?? "";
       const updated = await Bookings.update(req.params.id, req.shopId, updates);
+      if (!updated) return res.status(404).json({success:false,message:"Not found"});
       await createAuditLog(req, { action:"updated", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName} — ${booking.service}`, field:"payment", before, after:{quotedPrice:updated.quotedPrice,finalPrice:updated.finalPrice,paymentMethod:updated.paymentMethod,paymentStatus:updated.paymentStatus} });
       if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_updated",{id:req.params.id,booking:updated});
       res.json({ success:true, booking:updated });
-    } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
+    } catch (err) { console.error("PATCH /api/bookings/:id/payment:", err); res.status(500).json({success:false,message:"Server error"}); }
   }
 );
 
 // ── PATCH /api/bookings/:id — main status/notes/reschedule ───────────────────
 router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
+  rejectNested,
   [
     param("id").isUUID(),
-    body("status").optional().isIn(["pending","confirmed","waitlist","completed","cancelled","no_show"]),
-    body("notes").optional().trim().isLength({max:1000}),
-    body("time").optional().trim(), body("date").optional().isISO8601().toDate(),
-    body("sendSMS").optional().isBoolean(),
-    body("completedSmsVariant").optional().isIn(["with_review","without_review","none"]),
-    body("tireSize").optional().trim().isLength({max:50}),
-    body("doesntKnowTireSize").optional().isBoolean(),
+    body("status").optional().isString().bail().isIn(["pending","confirmed","waitlist","completed","cancelled","no_show"]),
+    body("notes").optional({ nullable:true }).isString().bail().trim().isLength({max:1000}).withMessage("Notes must be 1000 characters or fewer."),
+    // time/phone are format-checked in the handler, where an unchanged stored value
+    // (e.g. an older booking's phone) can be let through.
+    body("time").optional().isString().withMessage("Please choose a valid time, like 2:00 PM."),
+    // Kept as the YYYY-MM-DD string: no Date conversion, so 2026-02-30 is rejected
+    // instead of rolling over and no time zone can shift it to another day.
+    body("date").optional().isString().bail().trim().custom(isRealDate).withMessage("Please choose a valid date (YYYY-MM-DD)."),
+    body("sendSMS").optional().isBoolean().toBoolean(true),
+    body("completedSmsVariant").optional().isString().bail().isIn(["with_review","without_review","none"]),
+    body("tireSize").optional({ nullable:true }).isString().bail().trim().isLength({max:50}),
+    body("doesntKnowTireSize").optional().isBoolean().toBoolean(true),
     body("tireQuantity").optional({ nullable:true, checkFalsy:true }).isInt({min:1,max:50}).toInt(),
-    body("firstName").optional().trim().notEmpty().isLength({max:60}),
-    body("lastName").optional().trim().notEmpty().isLength({max:60}),
-    body("phone").optional().trim().matches(/^[\d\s\-\(\)\+]{7,20}$/),
-    body("email").optional({ checkFalsy:true }).trim().isEmail().normalizeEmail(),
-    body("bayNumber").optional().isInt({min:1,max:3}),
+    body("firstName").optional().isString().bail().trim().notEmpty().withMessage("Please enter a first name.").isLength({max:60}).withMessage("First name must be 60 characters or fewer."),
+    body("lastName").optional().isString().bail().trim().notEmpty().withMessage("Please enter a last name.").isLength({max:60}).withMessage("Last name must be 60 characters or fewer."),
+    body("phone").optional().isString().withMessage("Please enter a valid phone number, like 416-555-0000.").bail().trim(),
+    body("email").optional({ checkFalsy:true }).isString().bail().trim().isEmail().withMessage("Please enter a valid email address, like name@gmail.com.").normalizeEmail(),
+    body("bayNumber").optional().isInt({min:1,max:3}).toInt(),
   ], handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, notes, time, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, tireQuantity, firstName, lastName, phone, email, bayNumber } = req.body;
+      const { status, notes, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, tireQuantity, firstName, lastName, phone, email, bayNumber } = req.body;
+      let { time } = req.body;
 
       const current = await Bookings.findById(id);
-      if (!current||current.shopId!==req.shopId) return res.status(404).json({success:false,message:"Booking not found."});
+      if (!current||current.shopId!==req.shopId||current.deleted) return res.status(404).json({success:false,message:"Booking not found."});
+
+      // Time must be a real clock time (stored as "2:00 PM") — a garbage time would make
+      // a confirmed job stop blocking its bay. An unchanged stored value is let through.
+      if (time !== undefined && time.trim() !== current.time) {
+        time = normalizeTime(time);
+        if (!time) return res.status(422).json({ success:false, message:"Please choose a valid time, like 2:00 PM.", errors:[{ field:"time", message:"Please choose a valid time, like 2:00 PM." }] });
+      } else if (time !== undefined) time = current.time;
+      if (phone !== undefined && phone !== current.phone && !isPhone(phone)) {
+        return res.status(422).json({ success:false, message:"Please enter a valid phone number, like 416-555-0000.", errors:[{ field:"phone", message:"Please enter a valid phone number, like 416-555-0000." }] });
+      }
 
       // CQ5: load config once — reused for reschedule capacity check AND SMS sending below
       const { config } = await loadConfig(req.shopId);
 
-      if (time||date) {
-        const newDate = date ? (typeof date==="object"?date.toISOString().slice(0,10):date) : current.date;
-        const newTime = time || current.time;
-        const def     = resolveService(current.service, config);
-        const lockKey = `${req.shopId}|${newDate}|${def.resourcePool}`;
-        const capResult = await withSlotLock(lockKey, () =>
-          validateCapacity(newDate, newTime, current.service, req.shopId, id, config)
-        );
-        if (!capResult.ok) return res.status(409).json({success:false,message:capResult.reason});
+      const newDate = date || current.date;
+      const newTime = time || current.time;
+      const moved = newDate !== current.date || newTime !== current.time;
+      const statusChanged = status !== undefined && status !== current.status;
+      // Becoming confirmed takes a bay, so it needs the same capacity check as a move.
+      const needsCapacity = moved || (statusChanged && status === "confirmed");
+
+      if (date !== undefined && date !== current.date) {
+        const maxAhead = DateTime.now().setZone(config?.tz || "America/Toronto").plus({ years: 2 }).toISODate();
+        if (date > maxAhead) return res.status(400).json({ success:false, message:"That date is too far ahead. Please pick an earlier date." });
       }
 
       const updates = {};
       if (status!==undefined) updates.status=status;
-      if (notes!==undefined)  updates.notes=notes;
+      if (notes!==undefined)  updates.notes=notes ?? "";
       if (time!==undefined)   updates.time=time;
-      if (date!==undefined)   updates.date=(typeof date==="object"?date.toISOString().slice(0,10):date);
-      if (tireSize!==undefined) updates.tireSize=tireSize;
+      if (date!==undefined)   updates.date=date;
+      if (tireSize!==undefined) updates.tireSize=tireSize ?? "";
       if (doesntKnowTireSize!==undefined) updates.doesntKnowTireSize=doesntKnowTireSize;
       if (tireQuantity!==undefined) updates.tireQuantity = Number.isInteger(tireQuantity) ? tireQuantity : null;
       if (firstName!==undefined) updates.firstName=firstName;
@@ -614,27 +739,56 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
       if (email!==undefined)     updates.email=email;
       if (completedSmsVariant!==undefined) updates.completedSmsVariant=completedSmsVariant;
       if (bayNumber!==undefined) updates.bayNumber=bayNumber;
-      if (status==="completed") updates.completedAt=new Date().toISOString();
-      if (status==="no_show")   updates.noShowAt=new Date().toISOString();
+      // Only stamp these when the status actually changes — re-saving a completed job
+      // must not move its completion time to now.
+      if (statusChanged && status==="completed") updates.completedAt=new Date().toISOString();
+      if (statusChanged && status==="no_show")   updates.noShowAt=new Date().toISOString();
 
-      const updated = await Bookings.update(id, req.shopId, updates);
+      // Compare-and-set on the status: two simultaneous status changes can't both
+      // succeed (and both text the customer / write the audit entry).
+      const casOpts = statusChanged ? { expectStatus: current.status } : {};
+      let updated;
+      if (needsCapacity) {
+        // Check AND save inside the same per-slot lock as POST /book, so two confirms or
+        // reschedules into the same slot at the same moment can't both pass the check.
+        const def     = resolveService(current.service, config);
+        const lockKey = `${req.shopId}|${newDate}|${def.resourcePool}`;
+        const result = await withSlotLock(lockKey, async () => {
+          const cap = await validateCapacity(newDate, newTime, current.service, req.shopId, id, config);
+          if (!cap.ok) return { conflict: cap.reason };
+          return { updated: await Bookings.update(id, req.shopId, updates, casOpts) };
+        });
+        if (result.conflict) return res.status(409).json({success:false,message:result.conflict});
+        updated = result.updated;
+      } else {
+        updated = await Bookings.update(id, req.shopId, updates, casOpts);
+      }
+      if (!updated && casOpts.expectStatus) {
+        // Someone else changed the status a moment ago — nothing saved, nothing sent
+        const fresh = await Bookings.findById(id);
+        if (fresh && fresh.shopId === req.shopId && !fresh.deleted) {
+          if (fresh.status === status) return res.json({ success:true, booking:fresh, smsSent:false, message:`Already ${fresh.status}.` });
+          return res.status(409).json({ success:false, message:`This booking was just changed to "${fresh.status}" by someone else. Please refresh and try again.`, booking:fresh });
+        }
+      }
       if (!updated) return res.status(404).json({success:false,message:"Booking not found."});
 
       // Audit
       const changed = Object.keys(updates).filter(k=>String(current[k])!==String(updates[k]));
       if (changed.length) {
         await createAuditLog(req, {
-          action: status?"status_changed":"updated", entity:"booking", entityId:id,
+          action: statusChanged?"status_changed":"updated", entity:"booking", entityId:id,
           entityLabel:`${current.firstName} ${current.lastName} — ${current.time} ${current.date}`,
           field: changed.length===1?changed[0]:null,
           before: changed.length===1?current[changed[0]]:Object.fromEntries(changed.map(f=>[f,current[f]])),
-          after:  changed.length===1?updates[changed[0]]:updates,
+          after:  changed.length===1?updates[changed[0]]:Object.fromEntries(changed.map(f=>[f,updates[f]])),
         });
       }
 
-      // SMS — uses config loaded above (CQ5: no second loadConfig call)
+      // SMS — only when the status actually changed (re-saving an unchanged status must
+      // not text the customer again). Uses config loaded above (CQ5).
       let smsSent=false;
-      if (status&&triggerSMS!==false) {
+      if (statusChanged&&triggerSMS!==false) {
         let mt=null;
         if (status==="confirmed") mt="confirmed";
         if (status==="cancelled") mt="declined";
@@ -642,7 +796,11 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
         if (status==="completed") { if(completedSmsVariant==="with_review") mt="completed_review"; else if(completedSmsVariant==="without_review") mt="completed_no_review"; }
         if (mt) {
           const msgBody=buildSmsBody(mt,updated,config);
-          if (msgBody) { const log=await sendAndLog(id,req.shopId,updated.phone,mt,msgBody); smsSent=log.status==="sent"; }
+          if (msgBody) {
+            const log=await sendAndLog(id,req.shopId,updated.phone,mt,msgBody);
+            smsSent=log.status==="sent";
+            if (!log.duplicate) await logSmsAudit(req, updated, mt, log);
+          }
         }
       }
 
@@ -656,8 +814,9 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
 router.delete("/bookings/:id", adminAuth, requirePermission("manage:bookings"), [param("id").isUUID()], handleValidation, async (req, res) => {
   try {
     const booking = await Bookings.findById(req.params.id);
-    if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
-    await Bookings.softDelete(req.params.id, req.shopId);
+    if (!booking||booking.shopId!==req.shopId||booking.deleted) return res.status(404).json({success:false,message:"Not found"});
+    const deleted = await Bookings.softDelete(req.params.id, req.shopId);
+    if (!deleted) return res.status(404).json({success:false,message:"Not found"});
     await createAuditLog(req, { action:"deleted", entity:"booking", entityId:req.params.id, entityLabel:`${booking.firstName} ${booking.lastName} — ${booking.date} ${booking.time}`, meta:{service:booking.service,status:booking.status} });
     if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_deleted",{id:req.params.id});
     res.json({ success:true, message:"Booking moved to Recently Deleted." });
@@ -667,12 +826,29 @@ router.delete("/bookings/:id", adminAuth, requirePermission("manage:bookings"), 
 // ── PATCH /api/bookings/:id/restore ──────────────────────────────────────────
 router.patch("/bookings/:id/restore", adminAuth, requirePermission("manage:bookings"), [param("id").isUUID()], handleValidation, async (req, res) => {
   try {
-    const updated = await Bookings.restore(req.params.id, req.shopId);
+    const booking = await Bookings.findById(req.params.id);
+    if (!booking || booking.shopId !== req.shopId || !booking.deleted) return res.status(404).json({success:false,message:"Not found or not deleted."});
+    let updated;
+    if (booking.status === "confirmed") {
+      // A restored confirmed booking takes its bay back — its slot may have been
+      // re-booked since it was deleted, so check capacity under the same slot lock.
+      const { config } = await loadConfig(req.shopId);
+      const def = resolveService(booking.service, config);
+      const result = await withSlotLock(`${req.shopId}|${booking.date}|${def.resourcePool}`, async () => {
+        const cap = await validateCapacity(booking.date, booking.time, booking.service, req.shopId, booking.id, config);
+        if (!cap.ok) return { conflict: `Can't restore: ${cap.reason.replace(/ Please choose another time\.$/, "")} Re-book it at another time instead.` };
+        return { updated: await Bookings.restore(req.params.id, req.shopId) };
+      });
+      if (result.conflict) return res.status(409).json({success:false,message:result.conflict});
+      updated = result.updated;
+    } else {
+      updated = await Bookings.restore(req.params.id, req.shopId);
+    }
     if (!updated) return res.status(404).json({success:false,message:"Not found or not deleted."});
     await createAuditLog(req, { action:"restored", entity:"booking", entityId:req.params.id, entityLabel:`${updated.firstName} ${updated.lastName} — ${updated.date} ${updated.time}` });
     if (req.io) req.io.to(`shop:${req.shopId}`).emit("booking_restored",{id:req.params.id,booking:updated});
     res.json({ success:true, message:"Booking restored.", booking:updated });
-  } catch (err) { res.status(500).json({success:false,message:"Server error"}); }
+  } catch (err) { console.error("restore:", err); res.status(500).json({success:false,message:"Server error"}); }
 });
 
 // ── Wheel & Tire Inspection Report ────────────────────────────────────────────
@@ -765,7 +941,7 @@ router.patch("/bookings/:id/inspection", adminAuth, requirePermission("manage:bo
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+      if (!booking || booking.shopId !== req.shopId || booking.deleted) return res.status(404).json({ success:false, message:"Not found" });
 
       const b = req.body || {};
       const validIds = new Set(INSPECTION_SECTIONS.flatMap(s => s.items.map(([id]) => id)));
@@ -798,7 +974,7 @@ router.post("/bookings/:id/inspection/email", adminAuth, requirePermission("mana
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking || booking.shopId !== req.shopId) return res.status(404).json({ success:false, message:"Not found" });
+      if (!booking || booking.shopId !== req.shopId || booking.deleted) return res.status(404).json({ success:false, message:"Not found" });
       if (!booking.inspection) return res.status(400).json({ success:false, message:"Save the inspection before emailing it." });
       const to = req.body.email || booking.email;
       if (!to) return res.status(400).json({ success:false, message:"No email on file — enter one to send the report." });
@@ -823,14 +999,17 @@ router.post("/bookings/:id/sms", adminAuth, requirePermission("manage:bookings")
   async (req, res) => {
     try {
       const booking = await Bookings.findById(req.params.id);
-      if (!booking||booking.shopId!==req.shopId) return res.status(404).json({success:false,message:"Not found"});
-      if (!process.env.TWILIO_ACCOUNT_SID) return res.status(503).json({success:false,message:"Twilio not configured."});
+      if (!booking||booking.shopId!==req.shopId||booking.deleted) return res.status(404).json({success:false,message:"Not found"});
+      if (!process.env.TWILIO_ACCOUNT_SID) return res.status(503).json({success:false,message:"Text messages aren't set up for this shop yet, so nothing was sent. Please call the customer instead."});
       const { config } = await loadConfig(req.shopId);
       const msgBody = buildSmsBody(req.body.messageType, booking, config);
-      if (!msgBody) return res.status(400).json({success:false,message:"No template for this message type."});
+      if (!msgBody) return res.status(400).json({success:false,message:"There's no message template for this type of text."});
       const log = await sendAndLog(booking.id, req.shopId, booking.phone, req.body.messageType, msgBody);
-      res.json({ success:true, message:`SMS ${log.status} to ${booking.phone}`, log });
-    } catch (err) { res.status(500).json({success:false,message:err.message||"SMS failed"}); }
+      if (!log.duplicate) await logSmsAudit(req, booking, req.body.messageType, log);
+      if (log.duplicate) return res.json({ success:true, message:"This text was already sent in the last few minutes, so it wasn't sent again.", log });
+      if (log.status !== "sent") return res.status(502).json({ success:false, message:`The text to ${booking.phone} couldn't be sent. Please check the phone number, or call the customer instead.`, log });
+      res.json({ success:true, message:`SMS sent to ${booking.phone}`, log });
+    } catch (err) { console.error("POST /api/bookings/:id/sms:", err); res.status(500).json({success:false,message:"The text couldn't be sent. Please try again or call the customer."}); }
   }
 );
 
@@ -840,7 +1019,10 @@ router.get("/queue", async (req, res) => {
     const shopId = req.query.shopId||process.env.DEFAULT_SHOP_ID||"roadstar";
     const { date, bookingId } = req.query;
     if (!date||!bookingId) return res.status(400).json({success:false,message:"date and bookingId required"});
-    const active = await Bookings.find({ shop_id:shopId, date, status:{$in:["pending","confirmed","waitlist"]}, deleted:false }, { orderBy:{col:"time",asc:true} });
+    if (!isRealDate(date) || typeof bookingId !== "string") return res.status(400).json({success:false,message:"Invalid date or bookingId"});
+    // Sort by clock time in JS — text order would put "10:15 AM" before "9:15 AM"
+    const active = (await Bookings.find({ shop_id:shopId, date, status:{$in:["pending","confirmed","waitlist"]}, deleted:false }))
+      .sort((a, b) => timeSortKey(a.time) - timeSortKey(b.time));
     const idx = active.findIndex(b=>b.id===bookingId);
     if (idx===-1) return res.json({success:true,position:0,waitMinutes:0,message:"You are next!"});
     // UX3: sum actual service durations of bookings ahead instead of hardcoded 40min

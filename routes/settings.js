@@ -8,6 +8,7 @@ const { ShopSettings } = require("../lib/db");
 const adminAuth = require("../middleware/adminAuth");
 const { requirePermission } = require("../middleware/adminAuth");
 const { createAuditLog }    = require("../middleware/audit");
+const { isRealDate }        = require("../config/business");
 
 async function getOrCreate(shopId) {
   return ShopSettings.getOrCreate(shopId);
@@ -31,6 +32,50 @@ function detectGroup(keys) {
   return "settings";
 }
 
+// Reject values that would break the booking form or capacity maths (a 0-minute
+// service never blocks a bay; closing before opening; blank blackout dates).
+// Values the shop already had stored are let through unchanged, so an older saved
+// setting never blocks saving something else. Mutates updates (drops blank dates).
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+const DAY_NAMES = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+function validateSettings(updates, current) {
+  if (updates.hours !== undefined) {
+    const h = updates.hours;
+    if (!h || typeof h !== "object") return "Business hours are not in the right format.";
+    for (const [k, day] of Object.entries(h)) {
+      if (!day || (!day.open && !day.close)) continue; // closed
+      const prev = current.hours?.[k];
+      if (prev && prev.open === day.open && prev.close === day.close) continue;
+      const name = DAY_NAMES[k] || `Day ${k}`;
+      if (!HHMM.test(String(day.open || "")) || !HHMM.test(String(day.close || ""))) return `${name}: please enter both an opening and a closing time.`;
+      if (day.open >= day.close) return `${name}: closing time must be after opening time.`;
+    }
+  }
+  if (updates.blackoutDates !== undefined) {
+    if (!Array.isArray(updates.blackoutDates)) return "Blackout dates must be a list.";
+    // Blank rows (an added row with no date picked) are dropped, not saved as ""
+    const dates = updates.blackoutDates.filter(d => !(d === null || (typeof d === "string" && !d.trim())));
+    const prevDates = new Set(Array.isArray(current.blackoutDates) ? current.blackoutDates : []);
+    for (const d of dates) {
+      if (typeof d === "string" && prevDates.has(d)) continue;
+      if (typeof d !== "string" || !isRealDate(d.trim())) return "Please pick a valid date for every blackout day.";
+    }
+    updates.blackoutDates = [...new Set(dates.map(d => typeof d === "string" ? d.trim() : d))];
+  }
+  if (updates.services !== undefined) {
+    if (!Array.isArray(updates.services)) return "Services must be a list.";
+    const prevDur = new Map((current.services || []).map(s => [String(s?.name || "").trim(), Number(s?.serviceDuration ?? s?.service_duration)]));
+    for (const svc of updates.services) {
+      if (!svc || typeof svc !== "object") return "Services are not in the right format.";
+      const name = String(svc.name || "").trim();
+      const dur = Number(svc.serviceDuration ?? svc.service_duration ?? 30);
+      if (prevDur.has(name) && prevDur.get(name) === dur) continue;
+      if (!Number.isFinite(dur) || dur < 5 || dur > 600) return `"${name}" needs a duration between 5 and 600 minutes.`;
+    }
+  }
+  return null;
+}
+
 // ── GET /api/settings ─────────────────────────────────────────────────────────
 router.get("/settings", adminAuth, async (req, res) => {
   try {
@@ -52,6 +97,9 @@ router.patch("/settings", adminAuth, requirePermission("manage:settings"), async
       if (req.body[key] !== undefined) { updates[key] = req.body[key]; changedKeys.push(key); }
     }
     if (!changedKeys.length) return res.status(400).json({ success: false, message: "No valid fields to update" });
+
+    const invalid = validateSettings(updates, current);
+    if (invalid) return res.status(400).json({ success: false, message: invalid });
 
     const before = {};
     for (const k of changedKeys) before[k] = current[k];
