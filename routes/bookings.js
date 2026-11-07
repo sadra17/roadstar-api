@@ -702,11 +702,14 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
     body("phone").optional().isString().withMessage("Please enter a valid phone number, like 416-555-0000.").bail().trim(),
     body("email").optional({ checkFalsy:true }).isString().bail().trim().isEmail().withMessage("Please enter a valid email address, like name@gmail.com.").normalizeEmail(),
     body("bayNumber").optional().isInt({min:1,max:3}).toInt(),
+    // Vehicle — so mechanics know which car to pull in. Free text (picked from a list or typed).
+    body("carMakeModel").optional({ nullable:true }).isString().bail().trim().isLength({max:80}).withMessage("Car make and model must be 80 characters or fewer."),
+    body("carColor").optional({ nullable:true }).isString().bail().trim().isLength({max:40}).withMessage("Car color must be 40 characters or fewer."),
   ], handleValidation,
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, notes, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, tireQuantity, firstName, lastName, phone, email, bayNumber } = req.body;
+      const { status, notes, date, sendSMS:triggerSMS, completedSmsVariant, tireSize, doesntKnowTireSize, tireQuantity, firstName, lastName, phone, email, bayNumber, carMakeModel, carColor } = req.body;
       let { time } = req.body;
 
       const current = await Bookings.findById(id);
@@ -751,6 +754,8 @@ router.patch("/bookings/:id", adminAuth, requirePermission("manage:bookings"),
       if (email!==undefined)     updates.email=email;
       if (completedSmsVariant!==undefined) updates.completedSmsVariant=completedSmsVariant;
       if (bayNumber!==undefined) updates.bayNumber=bayNumber;
+      if (carMakeModel!==undefined) updates.carMakeModel=carMakeModel ?? "";
+      if (carColor!==undefined)     updates.carColor=carColor ?? "";
       // Only stamp these when the status actually changes — re-saving a completed job
       // must not move its completion time to now.
       if (statusChanged && status==="completed") updates.completedAt=new Date().toISOString();
