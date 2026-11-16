@@ -298,15 +298,75 @@ router.post("/book",
   }
 );
 
+// ── GET /api/bookings query parsing ──────────────────────────────────────────
+// Optional filters, all additive (with none of them the full history comes back as before):
+//   status=a | status=a,b,c   one status, or any of several
+//   from / to=YYYY-MM-DD      inclusive range on the appointment date (either end optional)
+//   q=text                    name / phone / email search across all dates; every word must
+//                             match one of first name, last name, email or phone
+//   limit=1..1000             the newest N appointments by date (q alone defaults to 300)
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+const isYmd = v => YMD_RE.test(v) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
+function parseBookingListQuery(query) {
+  const one = name => {
+    const v = query[name];
+    if (v === undefined || v === "") return { v: undefined };
+    if (typeof v !== "string") return { error: `${name} must be given once` };
+    return { v };
+  };
+  const out = {};
+  const st = one("status"); if (st.error) return st;
+  if (st.v !== undefined) {
+    if (st.v.includes(",")) {
+      const list = st.v.split(",").map(x => x.trim()).filter(Boolean);
+      if (!list.length || list.length > 10 || !list.every(x => /^[a-z_]{1,30}$/.test(x))) return { error: "status list is invalid" };
+      out.status = { $in: list };
+    } else out.status = st.v;
+  }
+  for (const k of ["from", "to"]) {
+    const r = one(k); if (r.error) return r;
+    if (r.v !== undefined) {
+      if (!isYmd(r.v)) return { error: `${k} must be a date (YYYY-MM-DD)` };
+      out[k] = r.v;
+    }
+  }
+  if (out.from && out.to && out.from > out.to) return { error: "from must be on or before to" };
+  const lim = one("limit"); if (lim.error) return lim;
+  if (lim.v !== undefined) {
+    if (!/^\d{1,4}$/.test(lim.v) || +lim.v < 1 || +lim.v > 1000) return { error: "limit must be a whole number from 1 to 1000" };
+    out.limit = +lim.v;
+  }
+  const qq = one("q"); if (qq.error) return qq;
+  const text = (qq.v || "").trim();
+  if (text) {
+    if (text.length > 100) return { error: "q is too long (max 100 characters)" };
+    out.search = text.split(/\s+/).slice(0, 6).map(word => {
+      const group = [["first_name", word], ["last_name", word], ["email", word], ["phone", word]];
+      if (word.replace(/\D/g, "").length >= 3) group.push(["phone", word, "digits"]);
+      return group;
+    });
+    if (!out.limit) out.limit = 300;
+  }
+  return out;
+}
+
 // ── GET /api/bookings — admin ─────────────────────────────────────────────────
 router.get("/bookings", adminAuth, requirePermission("view:bookings"), async (req, res) => {
   try {
     const { config } = await loadConfig(req.shopId);
-    const filter = { shop_id: req.shopId, deleted: false };
-    if (req.query.status) filter.status = req.query.status;
-    if (req.query.date)   filter.date   = req.query.date;
+    const parsed = parseBookingListQuery(req.query);
+    if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
 
-    const bookings = await Bookings.find(filter, { orderBy: { col: "date", asc: true } });
+    const filter = { shop_id: req.shopId, deleted: false };
+    if (parsed.status) filter.status = parsed.status;
+    if (req.query.date)   filter.date   = req.query.date;
+    else if (parsed.from || parsed.to) filter.date = { $gte: parsed.from, $lte: parsed.to };
+
+    // With a limit, return the newest N appointments (newest first); otherwise everything
+    // that matches, oldest first — the original behaviour when no new filter is passed.
+    const bookings = await Bookings.find(filter, parsed.limit
+      ? { orderBy: { col: "date", asc: false }, limit: parsed.limit, orSearchAll: parsed.search }
+      : { orderBy: { col: "date", asc: true }, orSearchAll: parsed.search });
 
     // P2: single batch query for all SMS logs instead of N per-booking queries
     const smsLogMap = await SmsLog.findByBookingBatch(bookings.map(b => b.id));
