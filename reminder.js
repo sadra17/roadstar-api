@@ -67,7 +67,7 @@ async function dispatchReminder(b, shopId, config, messageType) {
 async function runReminderCheck() {
   // Skip shops that run on their own API + Twilio number but share this database
   // (Uncle Jay, Roadstar Montréal). They send their own reminders.
-  const otherApiShops = (process.env.EXCLUDE_SHOP_IDS || "unclejay,roadstar-montreal")
+  const otherApiShops = (process.env.EXCLUDE_SHOP_IDS || "unclejay,roadstar-montreal,rapid-tire-gta")
     .split(",").map(s => s.trim()).filter(Boolean);
   const allSettings = (await ShopSettings.findAll()).filter(s => !otherApiShops.includes(s.shopId));
 
