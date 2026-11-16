@@ -71,7 +71,9 @@ function buildSmsBody(messageType, booking, shopConfig) {
   // Try both the original snake_case key AND the camelCase version to handle both DB states.
   const camelType = messageType.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
   const defaults = {
-    confirmed:           "Hi {firstName}! Your {shopName} appointment is CONFIRMED for {date} at {time} ({service}). See you soon! — {shopName}",
+    // Sent right away for a website booking that is still pending (not yet confirmed by staff)
+    received:            "Hi {firstName}, your appointment request with {shopName} for {service} on {date} at {time} has been sent. We'll text you as soon as it's confirmed. — {shopName}",
+    confirmed:           "Thanks {firstName}! Your {shopName} appointment is confirmed for {date} at {time} ({service}). See you soon! — {shopName}",
     declined:            "Hi {firstName}, we had to cancel your {time} appointment on {date}. Please call us to reschedule. — {shopName}",
     waitlist:            "Hi {firstName}! A spot just opened at {shopName} on {date}. Call us to claim it! — {shopName}",
     reminder:            "Hi {firstName}, reminder: your {shopName} appointment is TODAY at {time} for {service}. See you soon! — {shopName}",
@@ -288,6 +290,14 @@ router.post("/book",
         id: booking.id, customer: `${booking.firstName} ${booking.lastName}`,
         service: booking.service, date: booking.date, time: booking.time, status: booking.status,
       });
+
+      // Website booking that waits for staff: tell the customer the request was sent (not "booked").
+      // Walk-ins made by staff get no text here. Runs in the background so the form answers fast.
+      if (bookingSource === "online" && booking.status === "pending" && booking.phone) {
+        const msgBody = buildSmsBody("received", booking, config);
+        if (msgBody) sendAndLog(booking.id, shopId, booking.phone, "received", msgBody)
+          .catch(err => console.error("[SMS] received:", err.message));
+      }
 
       res.status(201).json({ success: true, message: "Booking created successfully.",
         booking: { id: booking.id, customer: `${booking.firstName} ${booking.lastName}`, service: booking.service, date: booking.date, time: booking.time, status: booking.status } });
