@@ -306,7 +306,8 @@ router.post("/book",
 //                             match one of first name, last name, email or phone
 //   limit=1..1000             the newest N appointments by date (q alone defaults to 300)
 const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
-const isYmd = v => YMD_RE.test(v) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
+// An impossible date like 2026-13-40 makes toISOString() throw, so check the date is valid first.
+const isYmd = v => { if (!YMD_RE.test(v)) return false; const d = new Date(`${v}T00:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v; };
 function parseBookingListQuery(query) {
   const one = name => {
     const v = query[name];
